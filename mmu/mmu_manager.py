@@ -3,20 +3,15 @@
 import datetime
 from collections import deque # Efficient for adding/removing from both ends
 import json # For TinyDB if we use it for complex objects
+import time 
+import os
+import shutil
 
 # --- For direct execution/testing of this file ---
 if __name__ == '__main__' and __package__ is None: # Only run if executed directly AND not as part of a package
     import sys
-    import os
-    # Get the parent directory of the current file's directory (e.g., 'offline_chat_bot')
-    # This allows finding the 'mmu' package.
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, project_root)
-    # If we are here, it means mmu_manager is being run directly.
-    # We need to make sure the import can resolve.
-    # For direct run, we might need to temporarily adjust __package__ or use absolute import after path mod.
-    # Let's try making the relative import work by ensuring the context is right.
-    # OR, more simply for direct run, we can condition the import:
     try:
         from .ltm import LTMManager # Try relative first (for package use)
     except ImportError:
@@ -39,6 +34,9 @@ except ImportError:
 
 DEFAULT_STM_MAX_TURNS = 10 # Default number of recent turns to keep in STM
 MTM_DATABASE_PATH = 'mtm_store.json' # Default path if TinyDB is used
+
+LTM_SQLITE_DB_PATH = 'ltm_main_database.db'
+LTM_CHROMA_PERSIST_DIRECTORY = "ltm_main_vector_store"
 
 class ShortTermMemory:
     """
@@ -266,114 +264,279 @@ class MediumTermMemory:
             self._initialize_in_memory_stores() # Re-initialize in-memory dicts
             # print("MTM: Cleared all in-memory session data.")
 
-# --- Update main test block ---
-if __name__ == "__main__":
-    print("--- Testing ShortTermMemory ---")
-    stm = ShortTermMemory(max_turns=3)
-    stm.add_turn("user", "Hello there!")
-    stm.add_turn("assistant", "General Kenobi!")
-    stm.add_turn("user", "You are a bold one.")
-    print("\nFormatted STM History:")
-    print(stm.get_formatted_history(include_timestamps=False)) # Simpler output for this test
-    stm.clear()
+class MemoryManagementUnit:
+    """
+    Central controller for all memory tiers: STM, MTM, and LTM.
+    Provides a unified API for memory operations.
+    """
+    def __init__(self,
+                 stm_max_turns: int = DEFAULT_STM_MAX_TURNS,
+                 mtm_use_tinydb: bool = False,
+                 mtm_db_path: str = MTM_DATABASE_PATH,
+                 ltm_sqlite_db_path: str = LTM_SQLITE_DB_PATH,
+                 ltm_chroma_persist_dir: str = LTM_CHROMA_PERSIST_DIRECTORY,
+                 #ltm_embedding_function = None # Allow passing custom embedding func to LTM
+                ):
+        """
+        Initializes all memory components.
 
-    print("\n--- Testing MediumTermMemory (In-Memory) ---")
-    mtm_in_memory = MediumTermMemory(use_tinydb=False)
-    mtm_in_memory.store_summary("sum_001", "User asked about Star Wars.", {"convo_id": "c1"})
-    mtm_in_memory.store_entity("user_prefs", "language", "english")
-    mtm_in_memory.store_task_context("current_project", {"name": "Death Star", "status": "operational"})
+        Args:
+            stm_max_turns (int): Max turns for Short-Term Memory.
+            mtm_use_tinydb (bool): Whether Medium-Term Memory should use TinyDB for persistence.
+            mtm_db_path (str): Path for MTM's TinyDB file (if used).
+            ltm_sqlite_db_path (str): Path for LTM's SQLite database file.
+            ltm_chroma_persist_dir (str): Directory for LTM's ChromaDB persistence.
+            ltm_embedding_function: Embedding function to pass to LTM's VectorStore.
+                                   If None, LTMManager will use its default.
+        """
+        print("Initializing MemoryManagementUnit...")
+        self.stm = ShortTermMemory(max_turns=stm_max_turns)
+        print(f"  STM initialized (max_turns={stm_max_turns}).")
 
-    print(f"Retrieved summary: {mtm_in_memory.get_summary('sum_001')['text']}")
-    print(f"Retrieved language pref: {mtm_in_memory.get_entity('user_prefs', 'language')}")
-    print(f"Retrieved project status: {mtm_in_memory.get_task_context('current_project')['status']}")
+        self.mtm = MediumTermMemory(use_tinydb=mtm_use_tinydb, db_path=mtm_db_path)
+        print(f"  MTM initialized (persistent={self.mtm.is_persistent}, path='{mtm_db_path if mtm_use_tinydb else 'in-memory'}').")
+        
+        # LTMManager's __init__ already has defaults for its paths if not provided,
+        # but we pass them explicitly here from MMU's config.
+        self.ltm = LTMManager(
+            db_path=ltm_sqlite_db_path,
+            chroma_persist_dir=ltm_chroma_persist_dir,
+            #embedding_function=ltm_embedding_function
+        )
+        print(f"  LTM initialized (SQLite='{ltm_sqlite_db_path}', Chroma_dir='{ltm_chroma_persist_dir}').")
+        print("MemoryManagementUnit initialization complete.")
+
+    # --- STM Facade Methods ---
+    def add_stm_turn(self, role: str, content: str):
+        self.stm.add_turn(role, content)
+
+    def get_stm_history(self) -> list:
+        return self.stm.get_history()
+
+    def get_stm_formatted_history(self, include_timestamps: bool = False) -> str:
+        return self.stm.get_formatted_history(include_timestamps=include_timestamps)
+
+    def clear_stm(self):
+        self.stm.clear()
+
+    def update_stm_scratchpad(self, content: str):
+        self.stm.update_scratchpad(content)
     
-    print("\nRecent summaries (in-memory):")
-    for summ in mtm_in_memory.get_recent_summaries(max_count=1): # Test with 1 for brevity
-        print(f"  - {summ['text']} (Updated: {summ.get('metadata', {}).get('last_updated')})")
+    def append_stm_scratchpad(self, content_to_append: str, separator: str = "\n"):
+        self.stm.append_to_scratchpad(content_to_append, separator)
 
-    mtm_in_memory.clear_session_data()
-    print(f"Summary after clear: {mtm_in_memory.get_summary('sum_001')}")
+    def get_stm_scratchpad(self) -> str:
+        return self.stm.get_scratchpad()
+
+    # --- MTM Facade Methods ---
+    def store_mtm_summary(self, summary_id: str, summary_text: str, metadata: dict = None):
+        self.mtm.store_summary(summary_id, summary_text, metadata)
+
+    def get_mtm_summary(self, summary_id: str) -> dict or None:
+        return self.mtm.get_summary(summary_id)
+
+    def get_mtm_recent_summaries(self, max_count: int = 5) -> list:
+        return self.mtm.get_recent_summaries(max_count)
+
+    def store_mtm_entity(self, category: str, entity_key: str, entity_value: any):
+        self.mtm.store_entity(category, entity_key, entity_value)
+
+    def get_mtm_entity(self, category: str, entity_key: str) -> any or None:
+        return self.mtm.get_entity(category, entity_key)
+    
+    def get_mtm_entities_by_category(self, category: str) -> dict or None:
+        return self.mtm.get_entities_by_category(category)
+
+    def store_mtm_task_context(self, context_key: str, data: any):
+        self.mtm.store_task_context(context_key, data)
+
+    def get_mtm_task_context(self, context_key: str) -> any or None:
+        return self.mtm.get_task_context(context_key)
+
+    def clear_mtm_session_data(self):
+        self.mtm.clear_session_data()
+
+    # --- LTM Facade Methods (from LTMManager) ---
+    def log_ltm_interaction(self, conversation_id: str, turn_sequence_id: int, role: str, content: str, **kwargs):
+        # Pass through kwargs to LTMManager's log_interaction
+        return self.ltm.log_interaction(conversation_id, turn_sequence_id, role, content, **kwargs)
+
+    def get_ltm_conversation_history(self, conversation_id: str, limit: int = None, offset: int = 0) -> list:
+        return self.ltm.get_conversation_history(conversation_id, limit, offset)
+    
+    def get_ltm_all_conversation_ids(self) -> list:
+        return self.ltm.get_all_conversation_ids()
+
+    def store_ltm_fact(self, subject: str, predicate: str, object_value: str, **kwargs):
+        return self.ltm.store_fact(subject, predicate, object_value, **kwargs)
+
+    def get_ltm_facts(self, subject: str = None, predicate: str = None, object_value: str = None) -> list:
+        return self.ltm.get_facts(subject, predicate, object_value)
+
+    def store_ltm_preference(self, category: str, key: str, value: str, user_id: str = "default_user") -> str:
+        return self.ltm.store_preference(category, key, value, user_id)
+
+    def get_ltm_preference(self, category: str, key: str, user_id: str = "default_user") -> dict:
+        return self.ltm.get_preference(category, key, user_id)
+
+    def add_document_to_ltm_vector_store(self, text_chunk: str, metadata: dict, doc_id: str = None) -> str:
+        return self.ltm.add_document_to_vector_store(text_chunk, metadata, doc_id)
+
+    def semantic_search_ltm_vector_store(self, query_text: str, top_k: int = 5, metadata_filter: dict = None) -> list:
+        return self.ltm.semantic_search_vector_store(query_text, top_k, metadata_filter)
+
+    def reset_all_ltm(self, confirm_reset: bool = False) -> bool:
+        """Resets all Long-Term Memory components (SQLite and ChromaDB)."""
+        return self.ltm.reset_ltm(confirm_reset=confirm_reset)
+
+    # --- Overall MMU Reset (optional, could combine MTM clear with LTM reset) ---
+    def reset_all_memory(self, confirm_reset: bool = False):
+        """
+        Resets STM, MTM, and LTM.
+        USE WITH CAUTION.
+        """
+        if not confirm_reset:
+            print("Full MMU reset aborted. `confirm_reset` must be True.")
+            return False
+        
+        print("Initiating full MMU reset...")
+        self.clear_stm()
+        print("  STM cleared.")
+        self.clear_mtm_session_data()
+        print("  MTM cleared.")
+        ltm_reset_success = self.reset_all_ltm(confirm_reset=True) # LTM reset already has its own confirmation
+        if ltm_reset_success:
+            print("Full MMU reset completed successfully.")
+            return True
+        else:
+            print("Full MMU reset completed, but LTM reset reported issues.")
+            return False
+
+# --- Updated __main__ to test MemoryManagementUnit ---
+if __name__ == "__main__":
+    print("--- Testing MemoryManagementUnit ---")
+
+    # Define paths for test databases for MMU context
+    test_mmu_mtm_db_path = 'test_mmu_mtm_store.json'
+    test_mmu_ltm_sqlite_db_path = 'test_mmu_ltm_sqlite.db'
+    test_mmu_ltm_chroma_dir = 'test_mmu_ltm_chroma'
+
+    # --- Cleanup previous test files for MMU ---
+    if os.path.exists(test_mmu_mtm_db_path): os.remove(test_mmu_mtm_db_path)
+    if os.path.exists(test_mmu_ltm_sqlite_db_path): os.remove(test_mmu_ltm_sqlite_db_path)
+    import shutil # For rmtree
+    if os.path.exists(test_mmu_ltm_chroma_dir): shutil.rmtree(test_mmu_ltm_chroma_dir)
+    # --- End MMU test file cleanup ---
+
+    # Initialize MMU
+    # For testing, we'll enable TinyDB for MTM to see its path logging.
+    # LTM will use its default embedding function (sentence-transformer).
+    mmu_instance = MemoryManagementUnit(
+        mtm_use_tinydb=TINYDB_AVAILABLE, # Only use TinyDB if available for test
+        mtm_db_path=test_mmu_mtm_db_path,
+        ltm_sqlite_db_path=test_mmu_ltm_sqlite_db_path,
+        ltm_chroma_persist_dir=test_mmu_ltm_chroma_dir
+    )
+
+    print("\n--- Testing STM via MMU ---")
+    mmu_instance.add_stm_turn("user", "MMU Test: User message 1")
+    mmu_instance.add_stm_turn("assistant", "MMU Test: Assistant response 1")
+    print(f"STM History via MMU: {mmu_instance.get_stm_history()}")
+    mmu_instance.update_stm_scratchpad("MMU STM scratchpad test.")
+    print(f"STM Scratchpad via MMU: {mmu_instance.get_stm_scratchpad()}")
+
+    print("\n--- Testing MTM via MMU ---")
+    mmu_instance.store_mtm_summary("mmu_sum_01", "MMU test summary.", {"source": "mmu_test"})
+    print(f"MTM Summary via MMU: {mmu_instance.get_mtm_summary('mmu_sum_01')}")
+    mmu_instance.store_mtm_entity("mmu_cat", "mmu_key", "mmu_value")
+    print(f"MTM Entity via MMU: {mmu_instance.get_mtm_entity('mmu_cat', 'mmu_key')}")
+
+    print("\n--- Testing LTM via MMU ---")
+    conv_id_mmu = "mmu_conv_001"
+    mmu_instance.log_ltm_interaction(conv_id_mmu, 1, "user", "LTM log via MMU.")
+    print(f"LTM History for {conv_id_mmu} via MMU: {len(mmu_instance.get_ltm_conversation_history(conv_id_mmu))} turns")
+    
+    # Check if the vector_store component of LTM is usable
+    # LTMManager's vector_store is an instance of VectorStoreChroma
+    # VectorStoreChroma's __init__ would raise an error or set self.collection to None if embedding_function failed.
+    # A more direct check is if the embedding function on the collection is set.
+    can_test_vector_store = False
+    if hasattr(mmu_instance.ltm, 'vector_store') and mmu_instance.ltm.vector_store and \
+    hasattr(mmu_instance.ltm.vector_store, 'collection') and mmu_instance.ltm.vector_store.collection and \
+    hasattr(mmu_instance.ltm.vector_store.collection, '_embedding_function') and \
+    mmu_instance.ltm.vector_store.collection._embedding_function is not None:
+        can_test_vector_store = True
+
+    if can_test_vector_store:
+        print("  LTM Vector Store seems available for testing via MMU.")
+        mmu_instance.add_document_to_ltm_vector_store("LTM vector search test via MMU.", {"tag": "mmu_test"})
+        time.sleep(0.5) # Give chroma a moment
+        search_results = mmu_instance.semantic_search_ltm_vector_store("MMU vector test")
+        print(f"LTM Vector Search results via MMU: {len(search_results)} found.")
+        if search_results:
+            print(f"  Top result text: '{search_results[0]['text_chunk']}'")
+    else:
+        print("  Skipping LTM vector store tests via MMU as its embedding function seems unavailable (check ltm.py output for warnings).")
 
 
-    if TINYDB_AVAILABLE:
-        print("\n--- Testing MediumTermMemory (TinyDB) ---")
-        test_mtm_db_path = 'test_mtm_store.json'
-        # Clean up previous test MTM store if it exists
-        import os
-        if os.path.exists(test_mtm_db_path):
-            # Attempt to close any lingering handles before removing
-            # This is a bit of a guess if we don't have the instance.
-            # For a clean test, ensuring instances are closed is better.
+    print("\n--- Testing Full MMU Reset ---")
+    # Add a bit more data before full reset
+    mmu_instance.add_stm_turn("user", "Another STM turn before reset.")
+    mmu_instance.store_mtm_summary("mmu_sum_02", "Another MTM summary before reset.")
+    mmu_instance.log_ltm_interaction(conv_id_mmu, 2, "assistant", "Another LTM log before reset.")
+
+    # Attempt reset without confirmation
+    print("\nAttempting full MMU reset (no confirm):")
+    mmu_instance.reset_all_memory(confirm_reset=False)
+
+    # Attempt reset WITH confirmation
+    print("\nAttempting full MMU reset (WITH confirm):")
+    reset_success = mmu_instance.reset_all_memory(confirm_reset=True)
+    print(f"Full MMU reset status: {reset_success}")
+
+    if reset_success:
+        print(f"STM History after reset: {mmu_instance.get_stm_history()}") # Should be empty
+        print(f"MTM Summary 'mmu_sum_01' after reset: {mmu_instance.get_mtm_summary('mmu_sum_01')}") # Should be None
+        print(f"LTM History for {conv_id_mmu} after reset: {len(mmu_instance.get_ltm_conversation_history(conv_id_mmu))} turns") # Should be 0
+        if can_test_vector_store: # Use the same check for post-reset verification
+            # After reset, the collection is re-created, so we re-check its count.
+            # The LTMManager.reset_ltm calls vector_store.clear_all_documents which recreates the collection.
+            if hasattr(mmu_instance.ltm.vector_store, 'collection') and mmu_instance.ltm.vector_store.collection:
+                print(f"LTM Chroma collection count after reset: {mmu_instance.ltm.vector_store.collection.count()}") # Should be 0
+            else:
+                print("LTM Chroma collection seems unavailable after reset.")
+    
+    print("\nMemoryManagementUnit test finished.")
+
+    # --- Final Cleanup of MMU test files (handles potential TinyDB lock) ---
+    if TINYDB_AVAILABLE and os.path.exists(test_mmu_mtm_db_path):
+        if hasattr(mmu_instance.mtm, 'db') and mmu_instance.mtm.db:
+             mmu_instance.mtm.db.close() # Close MTM's TinyDB if it was used
+        del mmu_instance.mtm # Help release MTM
+    
+    # LTM's ChromaDB might also hold locks, though its reset is more robust.
+    # Explicitly delete the MMU instance to help release all its components.
+    del mmu_instance 
+    # import gc
+    # gc.collect() # Optional garbage collect
+
+    print("\nAttempting final cleanup of MMU test files...")
+    files_to_remove = [test_mmu_mtm_db_path, test_mmu_ltm_sqlite_db_path]
+    dirs_to_remove = [test_mmu_ltm_chroma_dir]
+
+    for f_path in files_to_remove:
+        if os.path.exists(f_path):
             try:
-                temp_db_to_close = TinyDB(test_mtm_db_path) # Re-open to get a handle
-                temp_db_to_close.close()
-            except Exception: # If it fails (e.g. file corrupted or already locked)
-                pass
-            os.remove(test_mtm_db_path)
-
-        mtm_persistent = MediumTermMemory(use_tinydb=True, db_path=test_mtm_db_path)
-        mtm_persistent.store_summary("sum_t001", "Persistent summary about project requirements.", 
-                                     {"project_id": "p789", "version": 1})
-        mtm_persistent.store_summary("sum_t002", "User preferences for notifications discussed.",
-                                     {"user_id": "user123"})
-        mtm_persistent.store_entity("project_alpha", "status", "pending_review")
-        mtm_persistent.store_task_context("active_tool", {"name": "calculator", "last_used": "10:30"})
-        
-        # Explicitly close the first instance if it's no longer needed after writing
-        if hasattr(mtm_persistent, 'db') and mtm_persistent.db:
-            print(f"Closing initial TinyDB instance for {test_mtm_db_path}")
-            mtm_persistent.db.close()
-
-        # Re-initialize to test persistence (data should load from file)
-        print("Re-initializing MTM from TinyDB file to test persistence...")
-        mtm_persistent_load_test = MediumTermMemory(use_tinydb=True, db_path=test_mtm_db_path)
-        
-        retrieved_pers_sum = mtm_persistent_load_test.get_summary("sum_t001")
-        print(f"Retrieved persistent summary: {retrieved_pers_sum['text'] if retrieved_pers_sum else 'Not found'}")
-        
-        retrieved_pers_entity = mtm_persistent_load_test.get_entity("project_alpha", "status")
-        print(f"Retrieved persistent entity: {retrieved_pers_entity if retrieved_pers_entity else 'Not found'}")
-
-        print("\nRecent summaries (TinyDB):")
-        for summ in mtm_persistent_load_test.get_recent_summaries(max_count=2):
-            print(f"  - {summ['text']} (Updated: {summ.get('metadata', {}).get('last_updated')})")
-
-        mtm_persistent_load_test.clear_session_data() # This will truncate the tables in the JSON file
-        print(f"Summary after persistent clear: {mtm_persistent_load_test.get_summary('sum_t001')}")
-        
-        # Check if file is empty or tables are empty
-        if os.path.exists(test_mtm_db_path):
-            content_to_print = "File is empty or not valid JSON after clear."
-            try:
-                with open(test_mtm_db_path, 'r') as f:
-                    file_content_str = f.read()
-                    if file_content_str.strip(): # Check if the string is not empty after stripping whitespace
-                        content = json.loads(file_content_str) # Use json.loads for a string
-                        content_to_print = content
-                    else: # File was empty or only whitespace
-                        content_to_print = "{}" # Represent as empty JSON object string or dict
-            except json.JSONDecodeError:
-                # This will catch if the file has content but it's not valid JSON
-                print(f"Warning: {test_mtm_db_path} contains non-JSON data after clear, or was unexpectedly formatted.")
-                pass # content_to_print remains the default error message
+                os.remove(f_path)
+                print(f"  Removed {f_path}")
             except Exception as e:
-                print(f"An unexpected error occurred reading {test_mtm_db_path}: {e}")
-                pass
-
-
-            print(f"Content of {test_mtm_db_path} after clear: {content_to_print}")
-            
-            # It's good practice to close the MTM TinyDB instance before removing the file,
-            # though Python's garbage collection usually handles it.
-            if hasattr(mtm_persistent_load_test, 'db') and mtm_persistent_load_test.db:
-                mtm_persistent_load_test.db.close()
-            
+                print(f"  Could not remove {f_path}: {e}")
+    
+    for d_path in dirs_to_remove:
+        if os.path.exists(d_path):
             try:
-                os.remove(test_mtm_db_path) 
-                print(f"Successfully removed {test_mtm_db_path}")
-            except PermissionError as e:
-                print(f"Still could not remove {test_mtm_db_path}: {e}. File might still be locked.")
+                shutil.rmtree(d_path)
+                print(f"  Removed directory {d_path}")
             except Exception as e:
-                print(f"Error removing {test_mtm_db_path}: {e}")
-
-    print("\nShortTermMemory and MediumTermMemory tests finished.")
+                print(f"  Could not remove directory {d_path}: {e}")
+    print("Final cleanup attempt finished.")

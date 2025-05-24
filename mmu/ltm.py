@@ -8,6 +8,7 @@ import os # For path joining
 import chromadb
 from chromadb.utils import embedding_functions
 
+
 try:
     # Using a specific, known small model for consistency
     # If you have issues with this model, 'all-MiniLM-L6-v2' is another popular choice.
