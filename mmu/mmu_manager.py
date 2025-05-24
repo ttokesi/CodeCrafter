@@ -301,6 +301,14 @@ if __name__ == "__main__":
         # Clean up previous test MTM store if it exists
         import os
         if os.path.exists(test_mtm_db_path):
+            # Attempt to close any lingering handles before removing
+            # This is a bit of a guess if we don't have the instance.
+            # For a clean test, ensuring instances are closed is better.
+            try:
+                temp_db_to_close = TinyDB(test_mtm_db_path) # Re-open to get a handle
+                temp_db_to_close.close()
+            except Exception: # If it fails (e.g. file corrupted or already locked)
+                pass
             os.remove(test_mtm_db_path)
 
         mtm_persistent = MediumTermMemory(use_tinydb=True, db_path=test_mtm_db_path)
@@ -311,6 +319,11 @@ if __name__ == "__main__":
         mtm_persistent.store_entity("project_alpha", "status", "pending_review")
         mtm_persistent.store_task_context("active_tool", {"name": "calculator", "last_used": "10:30"})
         
+        # Explicitly close the first instance if it's no longer needed after writing
+        if hasattr(mtm_persistent, 'db') and mtm_persistent.db:
+            print(f"Closing initial TinyDB instance for {test_mtm_db_path}")
+            mtm_persistent.db.close()
+
         # Re-initialize to test persistence (data should load from file)
         print("Re-initializing MTM from TinyDB file to test persistence...")
         mtm_persistent_load_test = MediumTermMemory(use_tinydb=True, db_path=test_mtm_db_path)
@@ -355,6 +368,12 @@ if __name__ == "__main__":
             if hasattr(mtm_persistent_load_test, 'db') and mtm_persistent_load_test.db:
                 mtm_persistent_load_test.db.close()
             
-            os.remove(test_mtm_db_path) # Clean up test file
+            try:
+                os.remove(test_mtm_db_path) 
+                print(f"Successfully removed {test_mtm_db_path}")
+            except PermissionError as e:
+                print(f"Still could not remove {test_mtm_db_path}: {e}. File might still be locked.")
+            except Exception as e:
+                print(f"Error removing {test_mtm_db_path}: {e}")
 
     print("\nShortTermMemory and MediumTermMemory tests finished.")
