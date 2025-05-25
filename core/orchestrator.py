@@ -182,24 +182,58 @@ class ConversationOrchestrator:
         extracted_facts_from_user = self.fact_extractor.extract_facts(text_to_process=user_message)
         
         if extracted_facts_from_user: # Could be None (error) or [] (no facts found)
-            print(f"  CO: Extracted {len(extracted_facts_from_user)} fact(s) from user message.")
-            current_ltm_history_for_fact_source = self.mmu.get_ltm_conversation_history(conversation_id)
-            # Find the entry_id of the user turn we just added to STM, for LTM source_turn_ids
-            # This is a bit tricky as STM doesn't have IDs, and LTM logging of user turn happens later.
-            # For now, we'll store facts without direct source_turn_ids from this specific turn,
-            # or we can assume the current LTM turn count + 1 will be the ID of this user's turn.
-            # Let's assume for now, we log facts sourced from "user_direct_statement" metadata.
-            user_turn_source_id_placeholder = f"user_statement_in_{conversation_id}_approx_turn_{len(current_ltm_history_for_fact_source)+1}"
+            print(f"  CO: Raw extracted {len(extracted_facts_from_user)} fact(s) from user message by FactExtractionAgent.")
+            
+            # --- FILTERING Extracted Facts ---
+            filtered_facts_to_store = []
+            min_subject_object_len = 3 # Minimum length for subject/object to be considered non-trivial
+            # List of very generic predicates that often lead to unhelpful facts if S/O are also generic
+            generic_predicates_to_scrutinize = ["is", "are", "was", "were", "has", "have", "had", "be"] 
+            # List of trivial subjects/objects to often ignore
+            trivial_terms = ["my", "me", "i", "it", "this", "that", "the", "a", "an", "is", "are"] # lowercase
 
             for fact in extracted_facts_from_user:
-                print(f"    CO: Storing fact to LTM/SKB: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
-                self.mmu.store_ltm_fact(
-                    subject=fact['subject'],
-                    predicate=fact['predicate'],
-                    object_value=fact['object'], # LTM method takes object_value
-                    # source_turn_ids=[user_turn_source_id_placeholder], # Optional: link to user statement
-                    confidence=0.85 # Assign a default confidence for user-stated facts
-                )
+                s = str(fact.get('subject', '')).strip()
+                p = str(fact.get('predicate', '')).strip().lower() # Predicate to lower for matching
+                o = str(fact.get('object', '')).strip()
+
+                # Basic validation: ensure all parts exist and are not empty strings after stripping
+                if not s or not p or not o:
+                    print(f"    CO_FILTER: Skipping fact with empty S/P/O: {fact}")
+                    continue
+                
+                # Filter out facts with overly generic subjects/objects if predicate is also very generic
+                if p in generic_predicates_to_scrutinize:
+                    if s.lower() in trivial_terms or len(s) < min_subject_object_len:
+                        print(f"    CO_FILTER: Skipping fact with trivial subject and generic predicate: {fact}")
+                        continue
+                    if o.lower() in trivial_terms or len(o) < min_subject_object_len:
+                         print(f"    CO_FILTER: Skipping fact with trivial object and generic predicate: {fact}")
+                         continue
+                
+                # Filter if subject or object alone are too short/trivial (e.g. just "My")
+                # (This might be too aggressive, depends on desired fact granularity)
+                # if len(s) < min_subject_object_len and s.lower() in trivial_terms:
+                #    print(f"    CO_FILTER: Skipping fact with very trivial subject: {fact}")
+                #    continue
+
+                # Add more sophisticated filtering rules here if needed
+
+                filtered_facts_to_store.append({"subject": s, "predicate": p, "object": o}) # Store with cleaned values
+            # --- End FILTERING ---
+
+            if filtered_facts_to_store:
+                print(f"  CO: Storing {len(filtered_facts_to_store)} filtered fact(s) to LTM/SKB.")
+                for fact_to_store in filtered_facts_to_store:
+                    print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'")
+                    self.mmu.store_ltm_fact(
+                        subject=fact_to_store['subject'],
+                        predicate=fact_to_store['predicate'],
+                        object_value=fact_to_store['object'],
+                        confidence=0.80 # Slightly lower confidence for filtered auto-extracted facts
+                    )
+            else:
+                print("  CO: No facts to store after filtering.")
         else:
             if extracted_facts_from_user is None: # Error during extraction
                  print("  CO: Fact extraction from user message failed or encountered an error.")
@@ -329,14 +363,9 @@ if __name__ == "__main__":
     for fact in learned_facts_python:
         print(f"    SKB Fact: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
         # Check if one of the good extractions was stored
-        if (fact['subject'].lower() == 'programming language' and \
+        if (fact['subject'].lower() == 'my favorite programming language' and \
             fact['predicate'].lower() == 'is' and \
             fact['object'].lower() == 'python'):
-            found_python_fact = True
-            break
-        elif (fact['subject'].lower() == 'python' and \
-              fact['predicate'].lower() == 'is' and \
-              'favorite' in fact['object'].lower()): # Less ideal but plausible extraction
             found_python_fact = True
             break
     if found_python_fact:

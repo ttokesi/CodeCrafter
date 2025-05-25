@@ -274,17 +274,30 @@ class FactExtractionAgent:
         # We need to instruct the LLM to output in a specific JSON format.
         # This prompt might need significant iteration for reliability.
         prompt_content = (
-            f"Analyze the following text and extract up to {max_facts_to_extract} distinct factual statements "
-            f"from it. For each fact, identify the subject, predicate, and object.\n"
-            f"Present these facts as a JSON list of objects, where each object has 'subject', 'predicate', and 'object' keys.\n"
-            f"If no clear facts can be extracted, return an empty JSON list [].\n\n"
-            f"Example of desired output format:\n"
+            f"Your task is to analyze the provided text and extract key factual statements. "
+            f"Focus on identifying clear relationships between distinct entities or concepts. "
+            f"For each distinct fact, provide the subject, a meaningful predicate (verb or relational phrase), and the object.\n"
+            f"Try to make the subject as complete and specific as possible (e.g., instead of 'My', try 'My favorite color' if the text implies it).\n"
+            f"Extract up to {max_facts_to_extract} of the most important and clearly stated facts.\n"
+            f"Format your output as a JSON list of objects. Each object must have 'subject', 'predicate', and 'object' keys with string values.\n"
+            f"If the text contains no clear, distinct factual statements relevant to entities or their properties, return an empty JSON list [].\n"
+            f"Avoid extracting trivial or overly fragmented statements.\n\n"
+            f"Example of GOOD extractions:\n"
+            f"Text: \"My favorite color is blue and I live in London.\"\n"
+            f"Output:\n"
             f"[\n"
-            f'  {{"subject": "The sky", "predicate": "is", "object": "blue"}},\n'
-            f'  {{"subject": "Paris", "predicate": "is the capital of", "object": "France"}}\n'
+            f'  {{"subject": "My favorite color", "predicate": "is", "object": "blue"}},\n'
+            f'  {{"subject": "I", "predicate": "live in", "object": "London"}}\n'
+            f"]\n\n"
+            f"Example of POOR extractions (AVOID THESE):\n"
+            f"Text: \"My favorite color is blue.\"\n"
+            f"Output (Poor):\n"
+            f"[\n"
+            f'  {{"subject": "My", "predicate": "is", "object": "favorite"}},\n' # Subject too generic
+            f'  {{"subject": "color", "predicate": "is", "object": "blue"}}\n'   # Subject incomplete
             f"]\n\n"
             f"Text to analyze:\n\"\"\"\n{text_to_process}\n\"\"\"\n\n"
-            f"Extracted facts (JSON list only):\n"
+            f"Extracted facts (JSON list only, ensure valid JSON format):\n"
         )
 
         messages = [
