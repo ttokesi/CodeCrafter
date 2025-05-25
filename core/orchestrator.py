@@ -181,47 +181,63 @@ class ConversationOrchestrator:
         print(f"  CO: Attempting to extract facts from user message: \"{user_message[:100]}...\"")
         extracted_facts_from_user = self.fact_extractor.extract_facts(text_to_process=user_message)
         
-        if extracted_facts_from_user: # Could be None (error) or [] (no facts found)
+        if extracted_facts_from_user: # Could be None (error) or [] (no facts found by agent)
             print(f"  CO: Raw extracted {len(extracted_facts_from_user)} fact(s) from user message by FactExtractionAgent.")
             
-            # --- FILTERING Extracted Facts ---
             filtered_facts_to_store = []
-            min_subject_object_len = 3 # Minimum length for subject/object to be considered non-trivial
-            # List of very generic predicates that often lead to unhelpful facts if S/O are also generic
-            generic_predicates_to_scrutinize = ["is", "are", "was", "were", "has", "have", "had", "be"] 
-            # List of trivial subjects/objects to often ignore
-            trivial_terms = ["my", "me", "i", "it", "this", "that", "the", "a", "an", "is", "are"] # lowercase
+            # Define terms that suggest a question rather than a statement of fact
+            question_indicators = ["what", "where", "when", "who", "why", "how", "do you", "can you", "is there", "are there"]
+            # Define very short/common words that are often poor subjects/objects if not part of a larger phrase
+            common_fillers = ["is", "are", "was", "were", "am", "be", "the", "a", "an", "my", "me", "i", "it", "this", "that", "and", "or", "for", "to"]
+            min_meaningful_length = 3 # For S/O if they are not more specific types
 
-            for fact in extracted_facts_from_user:
+            # First, check if the original user_message looks like a question
+            is_likely_question = user_message.endswith("?") or any(user_message.lower().startswith(q_word) for q_word in ["what", "where", "when", "who", "why", "how", "do ", "can ", "is ", "are "])
+
+            if is_likely_question:
+                print(f"    CO_FILTER: User message \"{user_message[:50]}...\" appears to be a question. Extracted 'facts' from questions are usually not stored.")
+                # We might still log what the LLM extracted from a question for debugging, but not store it in SKB.
+                # For now, if it's a question, we don't store any "facts" derived from it.
+                extracted_facts_from_user = [] # Effectively discard facts from questions for SKB storage
+
+            for fact in extracted_facts_from_user: # Iterate remaining facts (or all if not a question)
                 s = str(fact.get('subject', '')).strip()
-                p = str(fact.get('predicate', '')).strip().lower() # Predicate to lower for matching
+                p = str(fact.get('predicate', '')).strip() # Keep predicate case as LLM gives it for now
                 o = str(fact.get('object', '')).strip()
 
-                # Basic validation: ensure all parts exist and are not empty strings after stripping
+                # Rule 1: Skip if any part is empty after stripping
                 if not s or not p or not o:
                     print(f"    CO_FILTER: Skipping fact with empty S/P/O: {fact}")
                     continue
                 
-                # Filter out facts with overly generic subjects/objects if predicate is also very generic
-                if p in generic_predicates_to_scrutinize:
-                    if s.lower() in trivial_terms or len(s) < min_subject_object_len:
-                        print(f"    CO_FILTER: Skipping fact with trivial subject and generic predicate: {fact}")
-                        continue
-                    if o.lower() in trivial_terms or len(o) < min_subject_object_len:
-                         print(f"    CO_FILTER: Skipping fact with trivial object and generic predicate: {fact}")
-                         continue
+                # Rule 2: Skip if subject AND object are both very short common words
+                if s.lower() in common_fillers and o.lower() in common_fillers and len(s) <= min_meaningful_length and len(o) <= min_meaningful_length:
+                    print(f"    CO_FILTER: Skipping fact with trivial subject and object: {fact}")
+                    continue
+
+                # Rule 3: Skip if the fact seems to be just rephrasing a question part (e.g. S:"my job", P:"What", O:"is")
+                # This is harder to generalize, but we can check for question words in P or O if S is possessive.
+                if (s.lower().startswith("my ") or s.lower().startswith("user's ")) and \
+                   (p.lower() in question_indicators or o.lower() in question_indicators or p.lower() == "what"): # Added "what" here
+                    print(f"    CO_FILTER: Skipping fact that looks like part of a question: {fact}")
+                    continue
                 
-                # Filter if subject or object alone are too short/trivial (e.g. just "My")
-                # (This might be too aggressive, depends on desired fact granularity)
-                # if len(s) < min_subject_object_len and s.lower() in trivial_terms:
-                #    print(f"    CO_FILTER: Skipping fact with very trivial subject: {fact}")
-                #    continue
+                # Rule 4: Subject should generally not be just "I" or "My" unless the prompt explicitly guided it.
+                # The new fact extraction prompt guides towards "user's name" etc.
+                # If the LLM still gives "I" or "My" as subject, it might be a less useful fact.
+                # However, "(S:I, P:enjoy, O:hiking)" is okay. This rule needs care.
+                # For now, let's allow "I" if P and O are substantial.
+                # Let's focus on filtering very generic S-P-O like (S:My, P:is, O:favorite)
 
-                # Add more sophisticated filtering rules here if needed
+                if s.lower() in ["my", "i"] and p.lower() in common_fillers and o.lower() in common_fillers:
+                    print(f"    CO_FILTER: Skipping overly generic first-person fact: {fact}")
+                    continue
 
-                filtered_facts_to_store.append({"subject": s, "predicate": p, "object": o}) # Store with cleaned values
-            # --- End FILTERING ---
-
+                # If it passed all filters, add it
+                # Storing predicate in lowercase for potentially easier matching later,
+                # but this depends on how we query. For now, let's keep case from LLM for P.
+                filtered_facts_to_store.append({"subject": s, "predicate": p, "object": o}) 
+            
             if filtered_facts_to_store:
                 print(f"  CO: Storing {len(filtered_facts_to_store)} filtered fact(s) to LTM/SKB.")
                 for fact_to_store in filtered_facts_to_store:
@@ -229,17 +245,18 @@ class ConversationOrchestrator:
                     self.mmu.store_ltm_fact(
                         subject=fact_to_store['subject'],
                         predicate=fact_to_store['predicate'],
-                        object_value=fact_to_store['object'],
-                        confidence=0.80 # Slightly lower confidence for filtered auto-extracted facts
+                        object_value=fact_to_store['object'], # LTM method takes object_value
+                        confidence=0.80 # Confidence for facts learned this way
                     )
             else:
-                print("  CO: No facts to store after filtering.")
-        else:
-            if extracted_facts_from_user is None: # Error during extraction
-                 print("  CO: Fact extraction from user message failed or encountered an error.")
-            else: # Empty list returned, meaning no facts found by the agent
-                 print("  CO: No facts extracted from user message.")
-        # --- End Fact Extraction from user message ---
+                if extracted_facts_from_user: # Means raw facts were extracted, but all got filtered out
+                    print("  CO: All raw extracted facts were filtered out. No facts stored.")
+                # else: No raw facts were extracted in the first place (already handled below)
+
+        elif extracted_facts_from_user is None: # Explicitly None means an error in FactExtractionAgent
+             print("  CO: Fact extraction from user message failed or encountered an error (agent returned None).")
+        else: # Empty list [] returned by agent, meaning it found no facts based on its logic
+             print("  CO: No facts extracted from user message by agent (agent returned empty list).")
 
         retrieved_knowledge = self.knowledge_retriever.search_knowledge(
             query_text=user_message,

@@ -83,58 +83,68 @@ class KnowledgeRetrieverAgent:
             except Exception as e: print(f"    Error during vector store search: {e}")
 
         if search_skb_facts:
-            found_skb_facts_dict = {} # Use dict to auto-deduplicate by fact_id
+            found_skb_facts_dict = {} 
 
             if skb_subject or skb_predicate or skb_object:
-                # If specific S, P, or O is provided, use that for a targeted query
-                # print(f"  - Performing SKB fact search (S:'{skb_subject}', P:'{skb_predicate}', O:'{skb_object}')...")
+                print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
                 try:
                     targeted_facts = self.mmu.get_ltm_facts(
-                        subject=skb_subject,
-                        predicate=skb_predicate,
-                        object_value=skb_object
+                        subject=skb_subject, predicate=skb_predicate, object_value=skb_object
                     )
+                    print(f"  KRA_DEBUG: Targeted search found {len(targeted_facts)} fact(s).")
                     for fact in targeted_facts:
-                        if 'fact_id' in fact: # Ensure fact_id exists
-                            found_skb_facts_dict[fact['fact_id']] = fact
+                        if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
                 except Exception as e:
                     print(f"    Error during targeted SKB fact search: {e}")
             
-            # Always perform broader keyword-based search if query_text is provided,
-            # unless specific S,P,O fully define the search and we only want that.
-            # For now, let's make keyword search additive if query_text exists.
             if query_text:
-                # print(f"  - Performing keyword-based SKB fact search for query: '{query_text}'...")
-                # Simple keyword extraction: split and use non-trivial words
-                # More advanced: NLP POS tagging to find nouns, verbs.
-                # For now, just split. A proper stopword list would be good here.
-                keywords = [kw for kw in query_text.lower().split() if len(kw) > 2] # Basic filter
+                # Basic stop word filtering AND PUNCTUATION STRIPPING
+                stop_words = ["what", "is", "my", "me", "i", "do", "you", "the", "a", "and", "tell", "about", "can", "does", "was", "are", "were", "of", "for", "on", "in", "at", "it"]
+                # Define characters to strip (punctuation)
+                punctuation_to_strip = str.maketrans('', '', '.,?!;:"()[]{}') # string.punctuation without '
 
-                for keyword in set(keywords): # Use set to avoid redundant keyword queries
+                raw_keywords = query_text.lower().split()
+                keywords = []
+                for kw_raw in raw_keywords:
+                    kw_cleaned = kw_raw.translate(punctuation_to_strip) # Strip punctuation
+                    if len(kw_cleaned) > 2 and kw_cleaned not in stop_words:
+                        keywords.append(kw_cleaned)
+                
+                print(f"  KRA_DEBUG: Performing keyword-based SKB search for query: '{query_text}'. Cleaned Keywords: {keywords}")
+
+                for keyword in set(keywords): 
+                    if not keyword: continue
+                    print(f"    KRA_DEBUG: Querying SKB with keyword '{keyword}'...")
                     try:
                         # Search keyword in subject
+                        print(f"      KRA_DEBUG: ...in subject LIKE '%{keyword}%'")
                         facts_subj = self.mmu.get_ltm_facts(subject=f"%{keyword}%")
+                        if facts_subj: print(f"        KRA_DEBUG: Found {len(facts_subj)} in subject for '{keyword}'.")
                         for fact in facts_subj:
                             if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
                         
                         # Search keyword in object
-                        facts_obj = self.mmu.get_ltm_facts(object_value=f"%{keyword}%") # LTM method uses object_value
+                        print(f"      KRA_DEBUG: ...in object LIKE '%{keyword}%'")
+                        facts_obj = self.mmu.get_ltm_facts(object_value=f"%{keyword}%") 
+                        if facts_obj: print(f"        KRA_DEBUG: Found {len(facts_obj)} in object for '{keyword}'.")
                         for fact in facts_obj:
                             if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
 
-                        # Optional: Search keyword in predicate (can be noisy)
-                        # facts_pred = self.mmu.get_ltm_facts(predicate=f"%{keyword}%")
-                        # for fact in facts_pred:
-                        #    if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
-
+                        print(f"      KRA_DEBUG: ...in predicate LIKE '%{keyword}%'")
+                        facts_pred = self.mmu.get_ltm_facts(predicate=f"%{keyword}%")
+                        if facts_pred: print(f"        KRA_DEBUG: Found {len(facts_pred)} in predicate for '{keyword}'.")
+                        for fact in facts_pred:
+                            if 'fact_id' in fact: # Ensure fact_id exists to use as key
+                                found_skb_facts_dict[fact['fact_id']] = fact    
+                    
                     except Exception as e:
                         print(f"    Error during keyword-based SKB fact search for '{keyword}': {e}")
             
             results["skb_fact_results"] = list(found_skb_facts_dict.values())
-            if results["skb_fact_results"]:
+            if results["skb_fact_results"]: # This print was there and seems to have been missing in the latest output
                 print(f"  KRA: Found {len(results['skb_fact_results'])} unique fact(s) from SKB based on query/params.")
-            # else: # Don't print "no facts" if it might have found some via specific params
-                # print("    No facts found in SKB for this general query.")
+            else: # If found_skb_facts_dict is still empty
+                print(f"  KRA: No unique facts found in SKB for this query/params.")
         
         return results
 
@@ -274,29 +284,34 @@ class FactExtractionAgent:
         # We need to instruct the LLM to output in a specific JSON format.
         # This prompt might need significant iteration for reliability.
         prompt_content = (
-            f"Your task is to analyze the provided text and extract key factual statements. "
+            f"Your primary task is to analyze the USER'S STATEMENT provided below and extract key factual claims made by the user about themselves, their preferences, named entities, or important events they describe. "
             f"Focus on identifying clear relationships between distinct entities or concepts. "
             f"For each distinct fact, provide the subject, a meaningful predicate (verb or relational phrase), and the object.\n"
-            f"Try to make the subject as complete and specific as possible (e.g., instead of 'My', try 'My favorite color' if the text implies it).\n"
-            f"Extract up to {max_facts_to_extract} of the most important and clearly stated facts.\n"
-            f"Format your output as a JSON list of objects. Each object must have 'subject', 'predicate', and 'object' keys with string values.\n"
-            f"If the text contains no clear, distinct factual statements relevant to entities or their properties, return an empty JSON list [].\n"
-            f"Avoid extracting trivial or overly fragmented statements.\n\n"
-            f"Example of GOOD extractions:\n"
-            f"Text: \"My favorite color is blue and I live in London.\"\n"
+            f"Important Guidelines for Subjects:\n"
+            f"  - If the user refers to themselves using 'I' or 'My' (e.g., 'My name is...', 'I like...'), try to make the subject more general and queryable, like 'user's name', 'user's preference', 'user's hobby', 'user's statement about X'.\n"
+            f"  - For other entities, use the specific name of the entity as the subject (e.g., 'Project Alpha', 'The AI Conference').\n"
+            f"  - The subject should be as complete and specific as possible to capture the core entity the fact is about.\n"
+            f"Extract up to {max_facts_to_extract} of the most important and clearly stated facts from the USER'S STATEMENT.\n"
+            f"Format your output STRICTLY as a JSON list of objects. Each object must have 'subject', 'predicate', and 'object' keys, and their values must be strings.\n"
+            f"If the USER'S STATEMENT contains no clear, distinct factual claims or is a question, return an empty JSON list [].\n"
+            f"Avoid extracting trivial, overly fragmented, or nonsensical statements. Focus on information that seems intended to be remembered.\n\n"
+            f"Example of GOOD extractions for USER STATEMENTS:\n"
+            f"USER'S STATEMENT: \"My name is Alex and I work as a software developer in New York.\"\n"
             f"Output:\n"
             f"[\n"
-            f'  {{"subject": "My favorite color", "predicate": "is", "object": "blue"}},\n'
-            f'  {{"subject": "I", "predicate": "live in", "object": "London"}}\n'
+            f'  {{"subject": "user name", "predicate": "is", "object": "Alex"}},\n'
+            f'  {{"subject": "user job", "predicate": "is", "object": "software developer"}},\n'
+            f'  {{"subject": "user location", "predicate": "is", "object": "New York"}}\n'
             f"]\n\n"
-            f"Example of POOR extractions (AVOID THESE):\n"
-            f"Text: \"My favorite color is blue.\"\n"
-            f"Output (Poor):\n"
+            f"USER'S STATEMENT: \"The upcoming Innovatech summit is in Berlin.\"\n"
+            f"Output:\n"
             f"[\n"
-            f'  {{"subject": "My", "predicate": "is", "object": "favorite"}},\n' # Subject too generic
-            f'  {{"subject": "color", "predicate": "is", "object": "blue"}}\n'   # Subject incomplete
+            f'  {{"subject": "Innovatech summit", "predicate": "location is", "object": "Berlin"}}\n'
             f"]\n\n"
-            f"Text to analyze:\n\"\"\"\n{text_to_process}\n\"\"\"\n\n"
+            f"USER'S STATEMENT: \"What time is it?\"\n" # Example of a question
+            f"Output:\n"
+            f"[]\n\n"
+            f"USER'S STATEMENT:\n\"\"\"\n{text_to_process}\n\"\"\"\n\n"
             f"Extracted facts (JSON list only, ensure valid JSON format):\n"
         )
 
