@@ -5,20 +5,18 @@ import shutil
 import time
 import gc 
 
-# Conditional imports for MMU, LSW, and Agents based on execution context
 if __name__ == '__main__' and __package__ is None:
     import sys
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
-    
     from mmu.mmu_manager import MemoryManagementUnit
     from core.llm_service_wrapper import LLMServiceWrapper
-    from core.agents import KnowledgeRetrieverAgent, SummarizationAgent
+    from core.agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent # <--- ADD FactExtractionAgent
 else:
     from mmu.mmu_manager import MemoryManagementUnit
     from .llm_service_wrapper import LLMServiceWrapper
-    from .agents import KnowledgeRetrieverAgent, SummarizationAgent
+    from .agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent # <--- ADD FactExtractionAgent
 
 # Default configuration for the orchestrator
 DEFAULT_MAX_CONTEXT_TOKENS_APPROX = 3000 # Approximate token limit for context fed to LLM
@@ -28,41 +26,32 @@ DEFAULT_MAX_CONTEXT_TOKENS_APPROX = 3000 # Approximate token limit for context f
 DEFAULT_TOP_K_VECTOR_SEARCH = 3
 
 class ConversationOrchestrator:
-    """
-    Manages the overall conversation flow, orchestrating interactions between
-    the user, MMU, LSW, and various agents/tools.
-    """
     def __init__(self, 
                  mmu: MemoryManagementUnit, 
                  lsw: LLMServiceWrapper,
                  knowledge_retriever: KnowledgeRetrieverAgent,
                  summarizer: SummarizationAgent,
-                 default_llm_model: str = None): # For main chat responses
-        """
-        Initializes the ConversationOrchestrator.
-
-        Args:
-            mmu (MemoryManagementUnit): Instance of the memory management unit.
-            lsw (LLMServiceWrapper): Instance of the LLM service wrapper.
-            knowledge_retriever (KnowledgeRetrieverAgent): Instance of the knowledge retriever agent.
-            summarizer (SummarizationAgent): Instance of the summarization agent.
-            default_llm_model (str, optional): Default LLM model to use for chat responses.
-                                               If None, LSW's default_chat_model is used.
-        """
-        if not all(isinstance(arg, expected_type) for arg, expected_type in [
-            (mmu, MemoryManagementUnit),
-            (lsw, LLMServiceWrapper),
+                 fact_extractor: FactExtractionAgent, # <--- ADD fact_extractor parameter
+                 default_llm_model: str = None):
+        
+        # Updated type checks
+        expected_args = [
+            (mmu, MemoryManagementUnit), (lsw, LLMServiceWrapper),
             (knowledge_retriever, KnowledgeRetrieverAgent),
-            (summarizer, SummarizationAgent)
-        ]):
+            (summarizer, SummarizationAgent),
+            (fact_extractor, FactExtractionAgent) # <--- ADD type check
+        ]
+        if not all(isinstance(arg, expected_type) for arg, expected_type in expected_args):
             raise TypeError("Invalid type for one or more arguments during CO initialization.")
 
         self.mmu = mmu
         self.lsw = lsw
         self.knowledge_retriever = knowledge_retriever
         self.summarizer = summarizer
+        self.fact_extractor = fact_extractor # <--- STORE fact_extractor instance
         self.default_llm_model = default_llm_model if default_llm_model else self.lsw.default_chat_model
-        self.active_conversation_id = None # <--- ADDED for STM management
+        self.active_conversation_id = None
+        
         print("ConversationOrchestrator initialized.")
         print(f"  Default LLM model for responses: {self.default_llm_model}")
 
@@ -172,28 +161,51 @@ class ConversationOrchestrator:
 
 
     def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
-        if not user_message.strip():
-            return "Please say something!"
-
-        # --- STM Management for conversation session ---
+        # ... (STM Management, initial print as before) ...
+        if not user_message.strip(): return "Please say something!"
         is_new_conversation_session = False
         if not conversation_id:
             conversation_id = str(uuid.uuid4())
-            print(f"CO: New conversation started (no ID provided), ID: {conversation_id}")
             is_new_conversation_session = True
         elif self.active_conversation_id != conversation_id:
-            print(f"CO: Switched to/started new conversation ID: {conversation_id} (was {self.active_conversation_id})")
             is_new_conversation_session = True
-        
-        self.active_conversation_id = conversation_id 
-
         if is_new_conversation_session:
+            print(f"CO: {'New conversation started' if not self.active_conversation_id else 'Switched to/started new conversation ID'}: {conversation_id} (was {self.active_conversation_id})")
             self.mmu.clear_stm()
             print(f"  CO: STM cleared for new conversation session '{conversation_id}'.")
-        # --- End STM Management ---
-
+        self.active_conversation_id = conversation_id 
         print(f"\nCO: Handling user message for conversation '{conversation_id}': '{user_message}'")
         self.mmu.add_stm_turn(role="user", content=user_message)
+
+        # --- Step 2.A: Extract facts from user's message and store in LTM/SKB ---
+        print(f"  CO: Attempting to extract facts from user message: \"{user_message[:100]}...\"")
+        extracted_facts_from_user = self.fact_extractor.extract_facts(text_to_process=user_message)
+        
+        if extracted_facts_from_user: # Could be None (error) or [] (no facts found)
+            print(f"  CO: Extracted {len(extracted_facts_from_user)} fact(s) from user message.")
+            current_ltm_history_for_fact_source = self.mmu.get_ltm_conversation_history(conversation_id)
+            # Find the entry_id of the user turn we just added to STM, for LTM source_turn_ids
+            # This is a bit tricky as STM doesn't have IDs, and LTM logging of user turn happens later.
+            # For now, we'll store facts without direct source_turn_ids from this specific turn,
+            # or we can assume the current LTM turn count + 1 will be the ID of this user's turn.
+            # Let's assume for now, we log facts sourced from "user_direct_statement" metadata.
+            user_turn_source_id_placeholder = f"user_statement_in_{conversation_id}_approx_turn_{len(current_ltm_history_for_fact_source)+1}"
+
+            for fact in extracted_facts_from_user:
+                print(f"    CO: Storing fact to LTM/SKB: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
+                self.mmu.store_ltm_fact(
+                    subject=fact['subject'],
+                    predicate=fact['predicate'],
+                    object_value=fact['object'], # LTM method takes object_value
+                    # source_turn_ids=[user_turn_source_id_placeholder], # Optional: link to user statement
+                    confidence=0.85 # Assign a default confidence for user-stated facts
+                )
+        else:
+            if extracted_facts_from_user is None: # Error during extraction
+                 print("  CO: Fact extraction from user message failed or encountered an error.")
+            else: # Empty list returned, meaning no facts found by the agent
+                 print("  CO: No facts extracted from user message.")
+        # --- End Fact Extraction from user message ---
 
         retrieved_knowledge = self.knowledge_retriever.search_knowledge(
             query_text=user_message,
@@ -227,184 +239,172 @@ class ConversationOrchestrator:
 
         # --- LTM Logging with Debug ---
         print(f"  CO: Preparing to log to LTM for conversation '{conversation_id}'.")
-        # It's crucial that get_ltm_conversation_history reflects transactions committed by previous turns.
-        # SQLite default isolation should handle this per call.
         current_ltm_history_len_before_log = len(self.mmu.get_ltm_conversation_history(conversation_id))
         user_turn_log_seq_id = current_ltm_history_len_before_log + 1
-        assistant_turn_log_seq_id = user_turn_log_seq_id + 1 # This will be the ID for the assistant's turn
-        
+        assistant_turn_log_seq_id = user_turn_log_seq_id + 1 
         print(f"    LTM logging: User turn seq ID: {user_turn_log_seq_id} for '{user_message[:30]}...'")
-        user_log_success = self.mmu.log_ltm_interaction( # Log user turn
-            conversation_id=conversation_id,
-            turn_sequence_id=user_turn_log_seq_id,
-            role="user",
-            content=user_message,
+        user_log_id = self.mmu.log_ltm_interaction(
+            conversation_id=conversation_id, turn_sequence_id=user_turn_log_seq_id,
+            role="user", content=user_message,
         )
-        if not user_log_success:
-            print(f"    LTM logging: FAILED to log user turn for seq ID {user_turn_log_seq_id}")
-            # Decide how to handle this. For now, we'll proceed to log assistant.
+        # Now we could use user_log_id if we re-extracted facts and wanted precise source_turn_ids
 
         print(f"    LTM logging: Assistant turn seq ID: {assistant_turn_log_seq_id} for '{assistant_response_text[:30]}...'")
-        self.mmu.log_ltm_interaction( # Log assistant turn
-            conversation_id=conversation_id,
-            turn_sequence_id=assistant_turn_log_seq_id,
-            role="assistant", # Role should be 'assistant' even if content is an error message
-            content=assistant_response_text,
-            llm_model_used=self.default_llm_model,
+        self.mmu.log_ltm_interaction(
+            conversation_id=conversation_id, turn_sequence_id=assistant_turn_log_seq_id,
+            role="assistant", content=assistant_response_text, llm_model_used=self.default_llm_model,
             metadata={
                 "retrieved_vector_ids": [res['id'] for res in retrieved_knowledge.get("vector_results",[]) if 'id' in res],
                 "retrieved_fact_ids": [fact['fact_id'] for fact in retrieved_knowledge.get("skb_fact_results",[]) if 'fact_id' in fact],
-                "llm_call_failed": assistant_response_text is None # Track if the LSW call itself failed
+                "llm_call_failed": assistant_response_text is None 
             }
         )
-        # --- End LTM Logging ---
-
         return assistant_response_text
 
-# --- Test Block ---
+# --- Update Test Block in orchestrator.py ---
 if __name__ == "__main__":
-    print("--- Testing ConversationOrchestrator ---")
+    print("--- Testing ConversationOrchestrator with Fact Extraction ---")
 
-    # --- Setup Test Environment (MMU, LSW, Agents) ---
-    # Define paths for test databases/stores for CO's MMU
-    test_co_ltm_sqlite_db_path = 'test_co_ltm_sqlite.db'
-    test_co_ltm_chroma_dir = 'test_co_ltm_chroma'
-    test_co_mtm_db_path = 'test_co_mtm_store.json' # CO's MTM
+    # --- Setup Test Environment ---
+    test_co_ltm_sqlite_db_path = 'test_co_learn_ltm_sqlite.db' # New DB for this test
+    test_co_ltm_chroma_dir = 'test_co_learn_ltm_chroma'
+    test_co_mtm_db_path = 'test_co_learn_mtm_store.json'
 
-    # Cleanup previous test files for CO
     if os.path.exists(test_co_mtm_db_path): os.remove(test_co_mtm_db_path)
     if os.path.exists(test_co_ltm_sqlite_db_path): os.remove(test_co_ltm_sqlite_db_path)
-    import shutil
     if os.path.exists(test_co_ltm_chroma_dir): shutil.rmtree(test_co_ltm_chroma_dir)
 
     test_mmu = None
     test_lsw = None
     knowledge_retriever = None
     summarizer = None
+    fact_extractor_co_test = None # New instance for CO test
     orchestrator = None
 
     try:
-        print("\nInitializing MMU for CO test...")
+        print("\nInitializing MMU for CO learning test...")
         test_mmu = MemoryManagementUnit(
             ltm_sqlite_db_path=test_co_ltm_sqlite_db_path,
             ltm_chroma_persist_dir=test_co_ltm_chroma_dir
         )
 
-        print("\nInitializing LSW for CO test...")
-        # Ensure Ollama is running and "gemma3:1b-it-fp16" (or your chosen default) is pulled
+        print("\nInitializing LSW for CO learning test...")
         test_lsw = LLMServiceWrapper(default_chat_model="gemma3:1b-it-fp16") 
         if not test_lsw.client: raise Exception("Ollama client in LSW failed to initialize.")
 
-        print("\nInitializing Agents for CO test...")
+        print("\nInitializing Agents for CO learning test...")
         knowledge_retriever = KnowledgeRetrieverAgent(mmu=test_mmu)
-        summarizer = SummarizationAgent(lsw=test_lsw) # Uses LSW's default chat model
+        summarizer = SummarizationAgent(lsw=test_lsw)
+        fact_extractor_co_test = FactExtractionAgent(lsw=test_lsw)
 
-        print("\nInitializing ConversationOrchestrator...")
+        print("\nInitializing ConversationOrchestrator with Fact Extraction...")
         orchestrator = ConversationOrchestrator(
             mmu=test_mmu,
             lsw=test_lsw,
             knowledge_retriever=knowledge_retriever,
-            summarizer=summarizer
+            summarizer=summarizer,
+            fact_extractor=fact_extractor_co_test # Pass it to CO
         )
     except Exception as e:
-        print(f"FATAL: Error during CO test environment setup: {e}")
-        print("Aborting CO tests.")
+        print(f"FATAL: Error during CO learning test environment setup: {e}")
         exit()
     
-    # --- Pre-populate LTM with some data for testing RAG ---
-    print("\nPre-populating LTM for RAG test...")
-    test_mmu.store_ltm_fact("The Conference", "location", "San Diego")
-    test_mmu.store_ltm_fact("The Conference", "date", "October 26th")
-    # Add to vector store only if LTM's embedding function is available
-    ltm_vector_store_ready_co_test = False
-    if hasattr(test_mmu.ltm, 'vector_store') and test_mmu.ltm.vector_store and \
-       hasattr(test_mmu.ltm.vector_store, 'collection') and test_mmu.ltm.vector_store.collection and \
-       hasattr(test_mmu.ltm.vector_store.collection, '_embedding_function') and \
-       test_mmu.ltm.vector_store.collection._embedding_function is not None:
-        ltm_vector_store_ready_co_test = True
+    # --- Test Conversation Flow with Learning ---
+    learning_convo_id = "learn_conv_001"
 
-    if ltm_vector_store_ready_co_test:
-        test_mmu.add_document_to_ltm_vector_store(
-            text_chunk="The upcoming AI conference will be held in San Diego. Key topics include LLMs and ethics.",
-            metadata={"source": "conference_brochure", "topic": "AI Conference"},
-            doc_id="conf_doc_1"
-        )
-        test_mmu.add_document_to_ltm_vector_store(
-            text_chunk="Remember that the project deadline for 'Project Starlight' is November 15th.",
-            metadata={"source": "internal_memo", "topic": "project_starlight"},
-            doc_id="starlight_memo_1"
-        )
-        import time
-        time.sleep(1) # Give Chroma a moment
-        print("LTM populated with a fact and vector documents.")
-    else:
-        print("LTM populated with a fact. Vector store population skipped as embedding fn seems unavailable.")
-
-
-    # --- Test Conversation Flow ---
-    conversation_test_id = "test_conv_123"
-
-    print(f"\n--- Test 1: User asks about the conference (expect RAG) ---")
+    print(f"\n--- Test 1 (Learning): User states a fact ---")
+    user_statement1 = "My favorite programming language is Python."
     response1 = orchestrator.handle_user_message(
-        user_message="Where is the AI conference being held?",
-        conversation_id=conversation_test_id
+        user_message=user_statement1,
+        conversation_id=learning_convo_id
     )
     print(f"Chatbot Response 1: {response1}")
 
-    print(f"\n--- Test 2: User asks a follow-up (STM context should help) ---")
+    # Check SKB for the learned fact
+    print("\n  CO_TEST: Checking SKB for learned fact about Python...")
+    # Query based on what was likely extracted and stored
+    learned_facts_python = test_mmu.get_ltm_facts(object_value="Python") # LTM method uses object_value
+    found_python_fact = False
+    print(f"    Querying SKB for object='Python'. Found {len(learned_facts_python)} potential fact(s).")
+    for fact in learned_facts_python:
+        print(f"    SKB Fact: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
+        # Check if one of the good extractions was stored
+        if (fact['subject'].lower() == 'programming language' and \
+            fact['predicate'].lower() == 'is' and \
+            fact['object'].lower() == 'python'):
+            found_python_fact = True
+            break
+        elif (fact['subject'].lower() == 'python' and \
+              fact['predicate'].lower() == 'is' and \
+              'favorite' in fact['object'].lower()): # Less ideal but plausible extraction
+            found_python_fact = True
+            break
+    if found_python_fact:
+        print("  CO_TEST: SUCCESS - Fact about Python seems to have been learned and stored in SKB.")
+    else:
+        print("  CO_TEST: FAILED - Fact about Python not found in SKB as expected.")
+
+
+    print(f"\n--- Test 2 (Recall): User asks about the learned fact ---")
+    # Start a new "logical" user interaction, but can be same conversation_id
+    # to see if STM + LTM (now with learned fact) helps.
+    # Or, use a new conversation_id and see if LTM alone can recall it. Let's try same convo first.
+    user_question1 = "What is my favorite programming language?"
     response2 = orchestrator.handle_user_message(
-        user_message="And what is its date?",
-        conversation_id=conversation_test_id 
+        user_message=user_question1,
+        conversation_id=learning_convo_id 
     )
     print(f"Chatbot Response 2: {response2}")
-    
-    print(f"\n--- Test 3: User asks about something not in LTM (general knowledge) ---")
+    # Ideal response: "Your favorite programming language is Python." (or similar, using the learned fact)
+
+    print(f"\n--- Test 3 (Learning another fact): User states another fact ---")
+    user_statement2 = "The project codename is Phoenix."
     response3 = orchestrator.handle_user_message(
-        user_message="What is the speed of light?",
-        conversation_id=conversation_test_id
+        user_message=user_statement2,
+        conversation_id=learning_convo_id
     )
     print(f"Chatbot Response 3: {response3}")
 
-    print(f"\n--- Test 4: Start a new conversation (STM should be cleared for it) ---")
-    new_convo_id = str(uuid.uuid4())
+    print("\n  CO_TEST: Checking SKB for learned fact about Project Phoenix...")
+    learned_facts_phoenix = test_mmu.get_ltm_facts(object_value="Phoenix")
+    found_phoenix_fact = False
+    print(f"    Querying SKB for object='Phoenix'. Found {len(learned_facts_phoenix)} potential fact(s).")
+    for fact in learned_facts_phoenix:
+        print(f"    SKB Fact: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
+        if (('project' in fact['subject'].lower() or 'codename' in fact['subject'].lower()) and \
+            fact['predicate'].lower() == 'is' and \
+            fact['object'].lower() == 'phoenix'):
+            found_phoenix_fact = True
+            break
+    if found_phoenix_fact:
+        print("  CO_TEST: SUCCESS - Fact about Phoenix seems to have been learned and stored in SKB.")
+    else:
+        print("  CO_TEST: FAILED - Fact about Phoenix not found in SKB as expected.")
+
+    print(f"\n--- Test 4 (Recall multiple facts): User asks a question that might use both ---")
+    # This might be too complex for the current simple RAG and prompt, but let's see
+    user_question2 = "Tell me about my favorite language and the project Phoenix."
     response4 = orchestrator.handle_user_message(
-        user_message="Tell me about Project Starlight.",
-        conversation_id=new_convo_id # CO should recognize this as new
+        user_message=user_question2,
+        conversation_id=learning_convo_id 
     )
-    print(f"Chatbot Response 4 (New Convo {new_convo_id}): {response4}")
-    # Check if STM for the new convo is fresh
-    print(f"STM for new convo '{new_convo_id}': {orchestrator.mmu.get_stm_history()}")
+    print(f"Chatbot Response 4: {response4}")
 
 
-    print("\n--- Checking LTM Contents After Conversation ---")
-    history_conv_test_id = test_mmu.get_ltm_conversation_history(conversation_test_id)
-    print(f"LTM history for '{conversation_test_id}' has {len(history_conv_test_id)} turns.")
-    # for turn in history_conv_test_id:
-    #     print(f"  - {turn['role']}: {turn['content'][:60]}...")
-
-    history_new_convo_id = test_mmu.get_ltm_conversation_history(new_convo_id)
-    print(f"LTM history for '{new_convo_id}' has {len(history_new_convo_id)} turns.")
-
-
-    print("\nConversationOrchestrator tests finished.")
-
-    # --- Final Cleanup of CO test files ---
-    print("\nAttempting final cleanup of CO test files...")
-    # Explicitly delete orchestrator and its components to help release resources
+    print("\nConversationOrchestrator learning tests finished.")
+    # ... (Final cleanup logic as before, using test_co_learn_* paths) ...
+    print("\nAttempting final cleanup of CO learning test files...")
     del orchestrator
     del knowledge_retriever
     del summarizer
-    if hasattr(test_lsw, 'client') and test_lsw.client: # LSW doesn't have a close for client
-        pass 
+    del fact_extractor_co_test # Delete the new agent instance
+    if hasattr(test_lsw, 'client') and test_lsw.client: pass 
     del test_lsw
     if hasattr(test_mmu, 'mtm') and test_mmu.mtm.is_persistent and hasattr(test_mmu.mtm, 'db') and test_mmu.mtm.db:
         test_mmu.mtm.db.close()
     del test_mmu
-    
-    import gc
     gc.collect()
     time.sleep(0.1)
-
     if os.path.exists(test_co_mtm_db_path): 
         try: os.remove(test_co_mtm_db_path)
         except Exception as e: print(f"  Could not remove {test_co_mtm_db_path}: {e}")
@@ -414,4 +414,4 @@ if __name__ == "__main__":
     if os.path.exists(test_co_ltm_chroma_dir): 
         try: shutil.rmtree(test_co_ltm_chroma_dir, ignore_errors=False)
         except Exception as e: print(f"  Could not remove directory {test_co_ltm_chroma_dir}: {e}")
-    print("CO test file cleanup attempt finished.")
+    print("CO learning test file cleanup attempt finished.")
