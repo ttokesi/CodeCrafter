@@ -70,8 +70,8 @@ class ConversationOrchestrator:
                                    conversation_id: str,
                                    user_query: str,
                                    retrieved_knowledge: dict,
-                                   max_context_words_approx: int = DEFAULT_MAX_CONTEXT_TOKENS_APPROX // 5 # Rough estimate: 1 token ~ 0.75 words, so 5 words ~ 3-4 tokens
-                                  ) -> str:
+                                   max_context_words_approx: int = DEFAULT_MAX_CONTEXT_TOKENS_APPROX // 5
+                                  ) -> list:
         """
         Constructs the full prompt to be sent to the LLM, incorporating:
         - System instructions
@@ -127,48 +127,48 @@ class ConversationOrchestrator:
         
         current_word_count = len(system_message_content.split())
         
-        # Add retrieved knowledge if it fits (prioritize it)
-        if retrieved_knowledge_str:
-            knowledge_word_count = len(retrieved_knowledge_str.split())
+        knowledge_word_count = 0 # Initialize to 0
+        if retrieved_knowledge_str: 
+            knowledge_word_count = len(retrieved_knowledge_str.split()) # Assign if there's knowledge
+            # The conditional check for length warning was inside this if, which is fine
             if current_word_count + knowledge_word_count < max_context_words_approx:
-                # Using a "user" role for context is a common hack if the LLM doesn't have a dedicated context slot
-                # or if we want the LLM to treat it as input it should pay close attention to.
-                # A "system" message could also work.
-                # Better: Some models support a specific format for RAG context.
-                # For now, let's try embedding it naturally.
-                # We'll build a context block to prepend to the user query.
-                pass # Will be prepended later to user message if it fits.
+                pass 
             else:
                 print(f"  CO: Warning - Retrieved knowledge too long ({knowledge_word_count} words), might be truncated or omitted. Max approx words: {max_context_words_approx}")
-                # Potentially summarize retrieved_knowledge_str here if too long
-                # For now, we might just not include it or include a part.
 
         # Add STM history, newest first, until context window is nearly full
         # (Actually, standard is oldest relevant STM first, then newer ones)
+        # Add STM history
         temp_history_str_parts = []
-        for turn in reversed(stm_history_turns[:-1]): # Exclude current user_query turn from STM history part
+        # The logic for relevant_stm_for_prompt I added in the previous step:
+        relevant_stm_for_prompt = stm_history_turns
+        if stm_history_turns: # Ensure stm_history_turns is not empty before accessing last element
+            last_turn = stm_history_turns[-1]
+            if last_turn.get("role") == "user" and last_turn.get("content") == user_query:
+                relevant_stm_for_prompt = stm_history_turns[:-1]
+
+        for turn in reversed(relevant_stm_for_prompt): 
             turn_str = f"{turn['role'].capitalize()}: {turn['content']}"
             turn_word_count = len(turn_str.split())
-            if current_word_count + knowledge_word_count + turn_word_count < max_context_words_approx:
-                temp_history_str_parts.insert(0, turn_str) # Insert at beginning to maintain order
+            # Now knowledge_word_count is always defined (0 if no knowledge)
+            if current_word_count + knowledge_word_count + turn_word_count + len(user_query.split()) < max_context_words_approx:
+                temp_history_str_parts.insert(0, turn_str) 
                 current_word_count += turn_word_count
             else:
-                break # Stop adding history if we are approaching the limit
+                break 
         
         full_user_prompt_content = ""
         if temp_history_str_parts:
             full_user_prompt_content += "Relevant Conversation History:\n" + "\n".join(temp_history_str_parts) + "\n\n"
             
-        if retrieved_knowledge_str and (len(full_user_prompt_content.split()) + len(retrieved_knowledge_str.split()) < max_context_words_approx):
+        # Check if retrieved_knowledge_str should be added (it might be empty)
+        if retrieved_knowledge_str and (len(full_user_prompt_content.split()) + knowledge_word_count + len(user_query.split()) < max_context_words_approx):
             full_user_prompt_content += "RETRIEVED KNOWLEDGE CONTEXT:\n" + retrieved_knowledge_str + "\n\n"
         
         full_user_prompt_content += f"User Query: {user_query}"
-        
         messages.append({"role": "user", "content": full_user_prompt_content})
         
-        # print(f"  CO: Final constructed messages for LLM: {messages}")
-        # print(f"  CO: Approx words in prompt: {current_word_count + len(user_query.split()) + knowledge_word_count}")
-        return messages
+        return messages # Return the list of messages
 
 
     def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
