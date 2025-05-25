@@ -14,7 +14,7 @@ if project_root not in sys.path:
 
 from mmu.mmu_manager import MemoryManagementUnit
 from core.llm_service_wrapper import LLMServiceWrapper
-from core.agents import KnowledgeRetrieverAgent, SummarizationAgent
+from core.agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent
 from core.orchestrator import ConversationOrchestrator
 
 # --- Configuration (can be moved to a config file/class later) ---
@@ -62,13 +62,16 @@ def initialize_chatbot_components():
 
     knowledge_retriever = KnowledgeRetrieverAgent(mmu=mmu)
     summarizer = SummarizationAgent(lsw=lsw) # Uses LSW's default chat model for summaries
+    # --- ADD FactExtractionAgent INSTANTIATION ---
+    fact_extractor = FactExtractionAgent(lsw=lsw) # Uses LSW's default chat model for extraction
+    # --- END ADDITION ---
 
     orchestrator = ConversationOrchestrator(
         mmu=mmu,
         lsw=lsw,
         knowledge_retriever=knowledge_retriever,
         summarizer=summarizer,
-        default_llm_model=LSW_DEFAULT_CHAT_MODEL # CO uses this for its main responses
+        fact_extractor=fact_extractor # <--- PASS fact_extractor HERE
     )
     
     print("\nChatbot components initialized successfully.")
