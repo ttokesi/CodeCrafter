@@ -72,55 +72,69 @@ class KnowledgeRetrieverAgent:
             "vector_results": [],
             "skb_fact_results": []
         }
-        print(f"\nKnowledgeRetrieverAgent: Searching for query: '{query_text}'")
+        #print(f"\nKnowledgeRetrieverAgent: Searching for query: '{query_text}'")
 
         # 1. Search Vector Store (Semantic Search)
         if search_vector_store:
             print(f"  - Performing semantic search in LTM Vector Store (top_k={top_k_vector})...")
             try:
-                vector_search_results = self.mmu.semantic_search_ltm_vector_store(
-                    query_text=query_text,
-                    top_k=top_k_vector
-                )
-                if vector_search_results:
-                    results["vector_results"] = vector_search_results
-                    print(f"    Found {len(vector_search_results)} item(s) from vector store.")
-                else:
-                    print("    No items found in vector store for this query.")
-            except Exception as e:
-                print(f"    Error during vector store search: {e}")
+                vector_search_results = self.mmu.semantic_search_ltm_vector_store(query_text=query_text, top_k=top_k_vector)
+                if vector_search_results: results["vector_results"] = vector_search_results
+            except Exception as e: print(f"    Error during vector store search: {e}")
 
-        # 2. Search Structured Knowledge Base (Facts)
         if search_skb_facts:
-            # Use specific SKB parameters if provided, otherwise, we could try a simple keyword search
-            # based on query_text for subject/object as a basic heuristic.
-            # For this version, we'll prioritize explicit params or a general query against object.
-            # A more advanced version might use NLP to parse query_text into S-P-O.
-            
-            effective_subject = skb_subject
-            effective_predicate = skb_predicate
-            effective_object = skb_object
+            found_skb_facts_dict = {} # Use dict to auto-deduplicate by fact_id
 
-            # Simplistic heuristic: if no specific SKB fields, use query_text for object search
-            if not skb_subject and not skb_predicate and not skb_object and query_text:
-                effective_object = query_text # Search query_text against the 'object' field
-                print(f"  - Performing SKB fact search (query_text='{query_text}' against 'object' field)...")
-            else:
-                 print(f"  - Performing SKB fact search (S:'{effective_subject}', P:'{effective_predicate}', O:'{effective_object}')...")
+            if skb_subject or skb_predicate or skb_object:
+                # If specific S, P, or O is provided, use that for a targeted query
+                # print(f"  - Performing SKB fact search (S:'{skb_subject}', P:'{skb_predicate}', O:'{skb_object}')...")
+                try:
+                    targeted_facts = self.mmu.get_ltm_facts(
+                        subject=skb_subject,
+                        predicate=skb_predicate,
+                        object_value=skb_object
+                    )
+                    for fact in targeted_facts:
+                        if 'fact_id' in fact: # Ensure fact_id exists
+                            found_skb_facts_dict[fact['fact_id']] = fact
+                except Exception as e:
+                    print(f"    Error during targeted SKB fact search: {e}")
             
-            try:
-                skb_fact_search_results = self.mmu.get_ltm_facts(
-                    subject=effective_subject,
-                    predicate=effective_predicate,
-                    object_value=effective_object # Note: LTM method uses 'object_value'
-                )
-                if skb_fact_search_results:
-                    results["skb_fact_results"] = skb_fact_search_results
-                    print(f"    Found {len(skb_fact_search_results)} fact(s) from SKB.")
-                else:
-                    print("    No facts found in SKB for these criteria.")
-            except Exception as e:
-                print(f"    Error during SKB fact search: {e}")
+            # Always perform broader keyword-based search if query_text is provided,
+            # unless specific S,P,O fully define the search and we only want that.
+            # For now, let's make keyword search additive if query_text exists.
+            if query_text:
+                # print(f"  - Performing keyword-based SKB fact search for query: '{query_text}'...")
+                # Simple keyword extraction: split and use non-trivial words
+                # More advanced: NLP POS tagging to find nouns, verbs.
+                # For now, just split. A proper stopword list would be good here.
+                keywords = [kw for kw in query_text.lower().split() if len(kw) > 2] # Basic filter
+
+                for keyword in set(keywords): # Use set to avoid redundant keyword queries
+                    try:
+                        # Search keyword in subject
+                        facts_subj = self.mmu.get_ltm_facts(subject=f"%{keyword}%")
+                        for fact in facts_subj:
+                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+                        
+                        # Search keyword in object
+                        facts_obj = self.mmu.get_ltm_facts(object_value=f"%{keyword}%") # LTM method uses object_value
+                        for fact in facts_obj:
+                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+
+                        # Optional: Search keyword in predicate (can be noisy)
+                        # facts_pred = self.mmu.get_ltm_facts(predicate=f"%{keyword}%")
+                        # for fact in facts_pred:
+                        #    if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+
+                    except Exception as e:
+                        print(f"    Error during keyword-based SKB fact search for '{keyword}': {e}")
+            
+            results["skb_fact_results"] = list(found_skb_facts_dict.values())
+            if results["skb_fact_results"]:
+                print(f"  KRA: Found {len(results['skb_fact_results'])} unique fact(s) from SKB based on query/params.")
+            # else: # Don't print "no facts" if it might have found some via specific params
+                # print("    No facts found in SKB for this general query.")
         
         return results
 
