@@ -514,13 +514,39 @@ if __name__ == "__main__":
              mmu_instance.mtm.db.close() # Close MTM's TinyDB if it was used
         del mmu_instance.mtm # Help release MTM
     
-    # LTM's ChromaDB might also hold locks, though its reset is more robust.
-    # Explicitly delete the MMU instance to help release all its components.
-    del mmu_instance 
-    # import gc
-    # gc.collect() # Optional garbage collect
-
+    # --- Final Cleanup of MMU test files ---
     print("\nAttempting final cleanup of MMU test files...")
+
+    # Try to explicitly close LTM resources if they exist and have close methods
+    if hasattr(mmu_instance, 'ltm'):
+        if hasattr(mmu_instance.ltm, 'raw_log') and hasattr(mmu_instance.ltm.raw_log, '_get_connection'):
+            # SQLite connections are usually managed with context managers (with...as)
+            # which close automatically. Forcing a close here is tricky without holding
+            # an explicit connection object. LTMManager's current design doesn't expose one.
+            # So, for SQLite, we rely on Python's GC when the LTMManager instance is deleted.
+            pass 
+        if hasattr(mmu_instance.ltm, 'skb') and hasattr(mmu_instance.ltm.skb, '_get_connection'):
+            # Same as above for SKB's SQLite.
+            pass
+        if hasattr(mmu_instance.ltm, 'vector_store') and hasattr(mmu_instance.ltm.vector_store, 'client'):
+            # ChromaDB client doesn't have an explicit close(). Persistence is handled by client.
+            # Deleting the LTMManager instance should help release it.
+            pass
+
+    # Close MTM's TinyDB if it was used and the instance exists
+    if hasattr(mmu_instance, 'mtm') and hasattr(mmu_instance.mtm, 'db') and mmu_instance.mtm.db:
+         print("  Closing MTM TinyDB instance...")
+         mmu_instance.mtm.db.close()
+    
+    # Explicitly delete the MMU instance to help release all its components
+    print("  Deleting MMU instance to help release resources...")
+    del mmu_instance 
+    
+    # Optional: Force garbage collection and a small delay
+    import gc
+    gc.collect()
+    time.sleep(0.1) # Give GC and OS a moment
+
     files_to_remove = [test_mmu_mtm_db_path, test_mmu_ltm_sqlite_db_path]
     dirs_to_remove = [test_mmu_ltm_chroma_dir]
 
@@ -530,7 +556,7 @@ if __name__ == "__main__":
                 os.remove(f_path)
                 print(f"  Removed {f_path}")
             except Exception as e:
-                print(f"  Could not remove {f_path}: {e}")
+                print(f"  Could not remove {f_path}: {e} (This can sometimes happen on Windows due to file locks. Manual deletion might be needed if it persists.)")
     
     for d_path in dirs_to_remove:
         if os.path.exists(d_path):
@@ -538,5 +564,5 @@ if __name__ == "__main__":
                 shutil.rmtree(d_path)
                 print(f"  Removed directory {d_path}")
             except Exception as e:
-                print(f"  Could not remove directory {d_path}: {e}")
+                print(f"  Could not remove directory {d_path}: {e} (This can sometimes happen on Windows due to file locks. Manual deletion might be needed if it persists.)")
     print("Final cleanup attempt finished.")
