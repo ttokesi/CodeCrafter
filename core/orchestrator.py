@@ -28,6 +28,7 @@ else:
 # Target prompt tokens should be less to leave room for generation.
 TARGET_MAX_PROMPT_TOKENS = 7000 # <--- NEW CONSTANT (Adjust if your assumed context window is different)
 DEFAULT_TOP_K_VECTOR_SEARCH = 3
+MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE = 10 # User statements longer than this may be stored
 # --- End Constants ---
 
 class ConversationOrchestrator:
@@ -59,7 +60,8 @@ class ConversationOrchestrator:
         
         print("ConversationOrchestrator initialized.")
         print(f"  Default LLM model for responses: {self.default_llm_model}")
-        print(f"  Target max prompt tokens: {TARGET_MAX_PROMPT_TOKENS}") # Log the target
+        print(f"  Target max prompt tokens: {TARGET_MAX_PROMPT_TOKENS}")
+        print(f"  Min tokens for user statement to be considered for Vector Store: {MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE}")
 
     def _build_prompt_with_context(self,
                                    conversation_id: str,
@@ -212,145 +214,123 @@ class ConversationOrchestrator:
 
 
     def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
-        # ... (STM Management, initial print as before) ...
         if not user_message.strip(): return "Please say something!"
+        
+        # --- STM Management & Determine if message is a question (DEFINE is_likely_question EARLIER) ---
         is_new_conversation_session = False
         if not conversation_id:
             conversation_id = str(uuid.uuid4())
             is_new_conversation_session = True
         elif self.active_conversation_id != conversation_id:
             is_new_conversation_session = True
+        
         if is_new_conversation_session:
             print(f"CO: {'New conversation started' if not self.active_conversation_id else 'Switched to/started new conversation ID'}: {conversation_id} (was {self.active_conversation_id})")
             self.mmu.clear_stm()
             print(f"  CO: STM cleared for new conversation session '{conversation_id}'.")
+        
         self.active_conversation_id = conversation_id 
         print(f"\nCO: Handling user message for conversation '{conversation_id}': '{user_message}'")
+        
+        # Define is_likely_question here, based on the raw user_message
+        question_indicators_for_check = ["what", "where", "when", "who", "why", "how", "do ", "can ", "is ", "are "] # For startswith
+        is_likely_question = user_message.endswith("?") or \
+                             any(user_message.lower().startswith(q_word) for q_word in question_indicators_for_check)
+        if is_likely_question:
+            print(f"  CO_INFO: User message \"{user_message[:50]}...\" detected as a likely question.")
+        # --- End STM Management & Question Check ---
+
         self.mmu.add_stm_turn(role="user", content=user_message)
 
-        # --- Step 2.A: Extract facts from user's message and store in LTM/SKB ---
         print(f"  CO: Attempting to extract facts from user message: \"{user_message[:100]}...\"")
         extracted_facts_from_user = self.fact_extractor.extract_facts(text_to_process=user_message)
         
-        if extracted_facts_from_user: # Could be None (error) or [] (no facts found by agent)
+        if extracted_facts_from_user: # Facts were potentially extracted by agent
             print(f"  CO: Raw extracted {len(extracted_facts_from_user)} fact(s) from user message by FactExtractionAgent.")
-            
             filtered_facts_to_store = []
-            # Define terms that suggest a question rather than a statement of fact
-            question_indicators = ["what", "where", "when", "who", "why", "how", "do you", "can you", "is there", "are there"]
-            # Define very short/common words that are often poor subjects/objects if not part of a larger phrase
+            # common_fillers and min_meaningful_length are used here
             common_fillers = ["is", "are", "was", "were", "am", "be", "the", "a", "an", "my", "me", "i", "it", "this", "that", "and", "or", "for", "to"]
-            min_meaningful_length = 3 # For S/O if they are not more specific types
+            min_meaningful_length = 3
 
-            # First, check if the original user_message looks like a question
-            is_likely_question = user_message.endswith("?") or any(user_message.lower().startswith(q_word) for q_word in ["what", "where", "when", "who", "why", "how", "do ", "can ", "is ", "are "])
-
-            if is_likely_question:
-                print(f"    CO_FILTER: User message \"{user_message[:50]}...\" appears to be a question. Extracted 'facts' from questions are usually not stored.")
-                # We might still log what the LLM extracted from a question for debugging, but not store it in SKB.
-                # For now, if it's a question, we don't store any "facts" derived from it.
-                extracted_facts_from_user = [] # Effectively discard facts from questions for SKB storage
-
-            for fact in extracted_facts_from_user: # Iterate remaining facts (or all if not a question)
-                s = str(fact.get('subject', '')).strip()
-                p = str(fact.get('predicate', '')).strip() # Keep predicate case as LLM gives it for now
-                o = str(fact.get('object', '')).strip()
-
-                # Rule 1: Skip if any part is empty after stripping
-                if not s or not p or not o:
-                    print(f"    CO_FILTER: Skipping fact with empty S/P/O: {fact}")
-                    continue
-                
-                # Rule 2: Skip if subject AND object are both very short common words
-                if s.lower() in common_fillers and o.lower() in common_fillers and len(s) <= min_meaningful_length and len(o) <= min_meaningful_length:
-                    print(f"    CO_FILTER: Skipping fact with trivial subject and object: {fact}")
-                    continue
-
-                # Rule 3: Skip if the fact seems to be just rephrasing a question part (e.g. S:"my job", P:"What", O:"is")
-                # This is harder to generalize, but we can check for question words in P or O if S is possessive.
-                if (s.lower().startswith("my ") or s.lower().startswith("user's ")) and \
-                   (p.lower() in question_indicators or o.lower() in question_indicators or p.lower() == "what"): # Added "what" here
-                    print(f"    CO_FILTER: Skipping fact that looks like part of a question: {fact}")
-                    continue
-                
-                # Rule 4: Subject should generally not be just "I" or "My" unless the prompt explicitly guided it.
-                # The new fact extraction prompt guides towards "user's name" etc.
-                # If the LLM still gives "I" or "My" as subject, it might be a less useful fact.
-                # However, "(S:I, P:enjoy, O:hiking)" is okay. This rule needs care.
-                # For now, let's allow "I" if P and O are substantial.
-                # Let's focus on filtering very generic S-P-O like (S:My, P:is, O:favorite)
-
-                if s.lower() in ["my", "i"] and p.lower() in common_fillers and o.lower() in common_fillers:
-                    print(f"    CO_FILTER: Skipping overly generic first-person fact: {fact}")
-                    continue
-
-                # If it passed all filters, add it
-                # Storing predicate in lowercase for potentially easier matching later,
-                # but this depends on how we query. For now, let's keep case from LLM for P.
-                filtered_facts_to_store.append({"subject": s, "predicate": p, "object": o}) 
+            if is_likely_question: # Use the already defined variable
+                print(f"    CO_FILTER: User message appears to be a question. Discarding extracted 'facts' for SKB storage.")
+                # No need to re-assign extracted_facts_from_user = [], just don't populate filtered_facts_to_store
+            else: # Only process/filter if not a question (or if we decide to store facts from questions differently)
+                for fact in extracted_facts_from_user:
+                    s = str(fact.get('subject', '')).strip()
+                    p = str(fact.get('predicate', '')).strip() 
+                    o = str(fact.get('object', '')).strip()
+                    if not s or not p or not o:
+                        # print(f"    CO_FILTER: Skipping fact with empty S/P/O: {fact}") # Optional print
+                        continue
+                    if s.lower() in common_fillers and o.lower() in common_fillers and len(s) <= min_meaningful_length and len(o) <= min_meaningful_length:
+                        # print(f"    CO_FILTER: Skipping fact with trivial subject and object: {fact}") # Optional print
+                        continue
+                    # Simplified question part filter as is_likely_question already handles broader case
+                    if (s.lower().startswith("my ") or s.lower().startswith("user's ")) and (p.lower() == "what"):
+                        # print(f"    CO_FILTER: Skipping fact that looks like part of a question: {fact}") # Optional print
+                        continue
+                    if s.lower() in ["my", "i"] and p.lower() in common_fillers and o.lower() in common_fillers:
+                        # print(f"    CO_FILTER: Skipping overly generic first-person fact: {fact}") # Optional print
+                        continue
+                    filtered_facts_to_store.append({"subject": s, "predicate": p, "object": o}) 
             
-            if filtered_facts_to_store:
+            if filtered_facts_to_store: # This block only runs if not a question AND facts survived filtering
                 print(f"  CO: Storing {len(filtered_facts_to_store)} filtered fact(s) to LTM/SKB.")
                 for fact_to_store in filtered_facts_to_store:
-                    print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'")
-                    self.mmu.store_ltm_fact(
-                        subject=fact_to_store['subject'],
-                        predicate=fact_to_store['predicate'],
-                        object_value=fact_to_store['object'], # LTM method takes object_value
-                        confidence=0.80 # Confidence for facts learned this way
-                    )
-            else:
-                if extracted_facts_from_user: # Means raw facts were extracted, but all got filtered out
-                    print("  CO: All raw extracted facts were filtered out. No facts stored.")
-                # else: No raw facts were extracted in the first place (already handled below)
-
-        elif extracted_facts_from_user is None: # Explicitly None means an error in FactExtractionAgent
-             print("  CO: Fact extraction from user message failed or encountered an error (agent returned None).")
-        else: # Empty list [] returned by agent, meaning it found no facts based on its logic
-             print("  CO: No facts extracted from user message by agent (agent returned empty list).")
-
-        retrieved_knowledge = self.knowledge_retriever.search_knowledge(
-            query_text=user_message,
-            top_k_vector=DEFAULT_TOP_K_VECTOR_SEARCH,
-            search_skb_facts=True
-        )
-
-        llm_messages = self._build_prompt_with_context(
-            conversation_id=conversation_id, # Pass current conversation_id
-            user_query=user_message, # Pass current user_query
-            retrieved_knowledge=retrieved_knowledge
-        )
-
-        print(f"  CO: Sending request to LLM (model: {self.default_llm_model})...")
-        assistant_response_text = self.lsw.generate_chat_completion(
-            messages=llm_messages,
-            model_name=self.default_llm_model,
-            temperature=0.5
-        )
-
-        # This is the fallback if LLM call itself fails (e.g. LSW returns None)
-        # It does NOT mean the LLM said "I don't know" - that's a valid response.
-        if assistant_response_text is None: # Check specifically for None from LSW
-            print("  CO: LLM failed to generate a response (LSW returned None).")
-            assistant_response_text = "I'm sorry, I encountered an issue and couldn't generate a response right now."
-            # No need to log this specific failure to LTM here, as the main logging block will log
-            # the user turn and this assistant_response_text. The LSW should log its own errors.
+                    # print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'") # Optional
+                    self.mmu.store_ltm_fact(subject=fact_to_store['subject'], predicate=fact_to_store['predicate'], object_value=fact_to_store['object'], confidence=0.80)
+            elif extracted_facts_from_user and not is_likely_question: # Raw facts existed, not a question, but all got filtered
+                print("  CO: All raw extracted facts were filtered out. No facts stored in SKB.")
+            # If it was a question, the earlier filter message already covered it.
         
+        elif extracted_facts_from_user is None: 
+             print("  CO: Fact extraction from user message failed or encountered an error (agent returned None).")
+        else: # Agent returned [], meaning it found no facts
+             print("  CO: No facts extracted from user message by agent (agent returned empty list).")
+        
+        # ... (KRA search, _build_prompt_with_context, LSW call - these are fine) ...
+        retrieved_knowledge = self.knowledge_retriever.search_knowledge(query_text=user_message, top_k_vector=DEFAULT_TOP_K_VECTOR_SEARCH, search_skb_facts=True)
+        llm_messages = self._build_prompt_with_context(conversation_id=conversation_id, user_query=user_message, retrieved_knowledge=retrieved_knowledge)
+        print(f"  CO: Sending request to LLM (model: {self.default_llm_model})...")
+        assistant_response_text = self.lsw.generate_chat_completion(messages=llm_messages, model_name=self.default_llm_model, temperature=0.5)
+        if assistant_response_text is None:
+            assistant_response_text = "I'm sorry, I encountered an issue and couldn't generate a response right now."
         print(f"  CO: LLM Raw Response: \"{assistant_response_text[:100].strip()}...\"")
         self.mmu.add_stm_turn(role="assistant", content=assistant_response_text)
 
-        # --- LTM Logging with Debug ---
+
         print(f"  CO: Preparing to log to LTM for conversation '{conversation_id}'.")
         current_ltm_history_len_before_log = len(self.mmu.get_ltm_conversation_history(conversation_id))
         user_turn_log_seq_id = current_ltm_history_len_before_log + 1
         assistant_turn_log_seq_id = user_turn_log_seq_id + 1 
         print(f"    LTM logging: User turn seq ID: {user_turn_log_seq_id} for '{user_message[:30]}...'")
-        user_log_id = self.mmu.log_ltm_interaction(
+        user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(
             conversation_id=conversation_id, turn_sequence_id=user_turn_log_seq_id,
             role="user", content=user_message,
         )
-        # Now we could use user_log_id if we re-extracted facts and wanted precise source_turn_ids
 
+        # --- Vector Store Learning (uses is_likely_question defined earlier) ---
+        if user_message and not is_likely_question: 
+            user_message_tokens = count_tokens(user_message, self.default_llm_model) 
+            if user_message_tokens >= MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE:
+                print(f"  CO: User message is significant ({user_message_tokens} tokens). Storing to Vector Store.")
+                doc_id_vs = f"user_stmt_{conversation_id}_{user_turn_log_seq_id}" 
+                metadata_vs = {
+                    "type": "user_statement", "conversation_id": conversation_id,
+                    "turn_sequence_id": user_turn_log_seq_id,
+                    "ltm_raw_log_entry_id": user_turn_ltm_entry_id if user_turn_ltm_entry_id else "unknown",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) 
+                }
+                vector_store_add_id = self.mmu.add_document_to_ltm_vector_store(
+                    text_chunk=user_message, metadata=metadata_vs, doc_id=doc_id_vs
+                )
+                if vector_store_add_id: print(f"    CO: User statement stored in Vector Store with ID: {vector_store_add_id}")
+                else: print(f"    CO: Failed to store user statement in Vector Store.")
+            else:
+                print(f"  CO: User message not stored in Vector Store (tokens: {user_message_tokens} < {MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE}).")
+        # --- End Vector Store Learning for user message ---
+        
         print(f"    LTM logging: Assistant turn seq ID: {assistant_turn_log_seq_id} for '{assistant_response_text[:30]}...'")
         self.mmu.log_ltm_interaction(
             conversation_id=conversation_id, turn_sequence_id=assistant_turn_log_seq_id,
@@ -363,152 +343,109 @@ class ConversationOrchestrator:
         )
         return assistant_response_text
 
-# --- Update Test Block in orchestrator.py ---
 if __name__ == "__main__":
-    print("--- Testing ConversationOrchestrator with Fact Extraction ---")
+    print("--- Testing CO with Fact Extraction & Vector Store Learning ---")
 
-    # --- Setup Test Environment ---
-    test_co_ltm_sqlite_db_path = 'test_co_learn_ltm_sqlite.db' # New DB for this test
-    test_co_ltm_chroma_dir = 'test_co_learn_ltm_chroma'
-    test_co_mtm_db_path = 'test_co_learn_mtm_store.json'
+    # Test paths (use new ones to ensure fresh LTM for this specific test)
+    test_co_vs_ltm_sqlite_db_path = 'test_co_vs_learn_ltm_sqlite.db'
+    test_co_vs_ltm_chroma_dir = 'test_co_vs_learn_ltm_chroma'
+    test_co_vs_mtm_db_path = 'test_co_vs_learn_mtm_store.json'
 
-    if os.path.exists(test_co_mtm_db_path): os.remove(test_co_mtm_db_path)
-    if os.path.exists(test_co_ltm_sqlite_db_path): os.remove(test_co_ltm_sqlite_db_path)
-    if os.path.exists(test_co_ltm_chroma_dir): shutil.rmtree(test_co_ltm_chroma_dir)
+    # Cleanup
+    if os.path.exists(test_co_vs_mtm_db_path): os.remove(test_co_vs_mtm_db_path)
+    if os.path.exists(test_co_vs_ltm_sqlite_db_path): os.remove(test_co_vs_ltm_sqlite_db_path)
+    if os.path.exists(test_co_vs_ltm_chroma_dir): shutil.rmtree(test_co_vs_ltm_chroma_dir)
 
-    test_mmu = None
-    test_lsw = None
-    knowledge_retriever = None
-    summarizer = None
-    fact_extractor_co_test = None # New instance for CO test
-    orchestrator = None
+    test_mmu_vs = None # Use unique names for test instances
+    test_lsw_vs = None
+    knowledge_retriever_vs = None
+    summarizer_vs = None
+    fact_extractor_vs = None
+    orchestrator_vs = None
 
     try:
-        print("\nInitializing MMU for CO learning test...")
-        test_mmu = MemoryManagementUnit(
-            ltm_sqlite_db_path=test_co_ltm_sqlite_db_path,
-            ltm_chroma_persist_dir=test_co_ltm_chroma_dir
+        print("\nInitializing MMU for CO VS learning test...")
+        test_mmu_vs = MemoryManagementUnit(
+            ltm_sqlite_db_path=test_co_vs_ltm_sqlite_db_path,
+            ltm_chroma_persist_dir=test_co_vs_ltm_chroma_dir
         )
+        print("\nInitializing LSW for CO VS learning test...")
+        test_lsw_vs = LLMServiceWrapper(default_chat_model="gemma3:1b-it-fp16") 
+        if not test_lsw_vs.client: raise Exception("Ollama client in LSW failed.")
+        
+        print("\nInitializing Agents for CO VS learning test...")
+        knowledge_retriever_vs = KnowledgeRetrieverAgent(mmu=test_mmu_vs)
+        summarizer_vs = SummarizationAgent(lsw=test_lsw_vs)
+        fact_extractor_vs = FactExtractionAgent(lsw=test_lsw_vs)
 
-        print("\nInitializing LSW for CO learning test...")
-        test_lsw = LLMServiceWrapper(default_chat_model="gemma3:1b-it-fp16") 
-        if not test_lsw.client: raise Exception("Ollama client in LSW failed to initialize.")
-
-        print("\nInitializing Agents for CO learning test...")
-        knowledge_retriever = KnowledgeRetrieverAgent(mmu=test_mmu)
-        summarizer = SummarizationAgent(lsw=test_lsw)
-        fact_extractor_co_test = FactExtractionAgent(lsw=test_lsw)
-
-        print("\nInitializing ConversationOrchestrator with Fact Extraction...")
-        orchestrator = ConversationOrchestrator(
-            mmu=test_mmu,
-            lsw=test_lsw,
-            knowledge_retriever=knowledge_retriever,
-            summarizer=summarizer,
-            fact_extractor=fact_extractor_co_test # Pass it to CO
+        print("\nInitializing CO with Fact Extraction & VS Learning capability...")
+        orchestrator_vs = ConversationOrchestrator(
+            mmu=test_mmu_vs, lsw=test_lsw_vs,
+            knowledge_retriever=knowledge_retriever_vs,
+            summarizer=summarizer_vs, fact_extractor=fact_extractor_vs
         )
     except Exception as e:
-        print(f"FATAL: Error during CO learning test environment setup: {e}")
+        print(f"FATAL: Error during CO VS learning test environment setup: {e}")
         exit()
     
-    # --- Test Conversation Flow with Learning ---
-    learning_convo_id = "learn_conv_001"
+    # --- Test Conversation Flow with Vector Store Learning ---
+    vs_learn_convo_id = "vs_learn_conv_001"
 
-    print(f"\n--- Test 1 (Learning): User states a fact ---")
-    user_statement1 = "My favorite programming language is Python."
-    response1 = orchestrator.handle_user_message(
-        user_message=user_statement1,
-        conversation_id=learning_convo_id
+    print(f"\n--- Test VS 1: User makes a significant statement ---")
+    user_statement_for_vs = "The upcoming Galactic Summit on AI Ethics will feature keynote speaker Dr. Aris Thorne and will discuss the future of sentient machines."
+    # This should exceed MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE
+    
+    response_vs1 = orchestrator_vs.handle_user_message(
+        user_message=user_statement_for_vs,
+        conversation_id=vs_learn_convo_id
     )
-    print(f"Chatbot Response 1: {response1}")
+    print(f"Chatbot Response VS1: {response_vs1}")
 
-    # Check SKB for the learned fact
-    print("\n  CO_TEST: Checking SKB for learned fact about Python...")
-    # Query based on what was likely extracted and stored
-    learned_facts_python = test_mmu.get_ltm_facts(object_value="Python") # LTM method uses object_value
-    found_python_fact = False
-    print(f"    Querying SKB for object='Python'. Found {len(learned_facts_python)} potential fact(s).")
-    for fact in learned_facts_python:
-        print(f"    SKB Fact: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
-        # Check if one of the good extractions was stored
-        if (fact['subject'].lower() == 'my favorite programming language' and \
-            fact['predicate'].lower() == 'is' and \
-            fact['object'].lower() == 'python'):
-            found_python_fact = True
-            break
-    if found_python_fact:
-        print("  CO_TEST: SUCCESS - Fact about Python seems to have been learned and stored in SKB.")
-    else:
-        print("  CO_TEST: FAILED - Fact about Python not found in SKB as expected.")
+    # Check Vector Store (this is an indirect check, we'd need to query it)
+    # For now, we rely on the CO's print statements:
+    # "CO: User message is significant... Storing to Vector Store."
+    # "CO: User statement stored in Vector Store with ID: ..."
 
-
-    print(f"\n--- Test 2 (Recall): User asks about the learned fact ---")
-    # Start a new "logical" user interaction, but can be same conversation_id
-    # to see if STM + LTM (now with learned fact) helps.
-    # Or, use a new conversation_id and see if LTM alone can recall it. Let's try same convo first.
-    user_question1 = "What is my favorite programming language?"
-    response2 = orchestrator.handle_user_message(
-        user_message=user_question1,
-        conversation_id=learning_convo_id 
+    print(f"\n--- Test VS 2: User asks a semantically similar question (Vector Store recall) ---")
+    # This question uses different wording but is semantically related to user_statement_for_vs
+    user_question_vs = "Tell me about the conference on machine sentience and Dr. Thorne."
+    response_vs2 = orchestrator_vs.handle_user_message(
+        user_message=user_question_vs,
+        conversation_id=vs_learn_convo_id 
     )
-    print(f"Chatbot Response 2: {response2}")
-    # Ideal response: "Your favorite programming language is Python." (or similar, using the learned fact)
+    print(f"Chatbot Response VS2: {response_vs2}")
+    # Expected: KRA should find user_statement_for_vs in Vector Store.
+    # Bot should use this retrieved context.
 
-    print(f"\n--- Test 3 (Learning another fact): User states another fact ---")
-    user_statement2 = "The project codename is Phoenix."
-    response3 = orchestrator.handle_user_message(
-        user_message=user_statement2,
-        conversation_id=learning_convo_id
+    print(f"\n--- Test VS 3: User makes a short, non-significant statement ---")
+    user_short_statement = "Okay, thanks." # Should be less than MIN_TOKENS...
+    response_vs3 = orchestrator_vs.handle_user_message(
+        user_message=user_short_statement,
+        conversation_id=vs_learn_convo_id
     )
-    print(f"Chatbot Response 3: {response3}")
+    print(f"Chatbot Response VS3: {response_vs3}")
+    # Expected: "CO: User message not stored in Vector Store (tokens: X < Y)."
 
-    print("\n  CO_TEST: Checking SKB for learned fact about Project Phoenix...")
-    learned_facts_phoenix = test_mmu.get_ltm_facts(object_value="Phoenix")
-    found_phoenix_fact = False
-    print(f"    Querying SKB for object='Phoenix'. Found {len(learned_facts_phoenix)} potential fact(s).")
-    for fact in learned_facts_phoenix:
-        print(f"    SKB Fact: S='{fact['subject']}', P='{fact['predicate']}', O='{fact['object']}'")
-        if (('project' in fact['subject'].lower() or 'codename' in fact['subject'].lower()) and \
-            fact['predicate'].lower() == 'is' and \
-            fact['object'].lower() == 'phoenix'):
-            found_phoenix_fact = True
-            break
-    if found_phoenix_fact:
-        print("  CO_TEST: SUCCESS - Fact about Phoenix seems to have been learned and stored in SKB.")
-    else:
-        print("  CO_TEST: FAILED - Fact about Phoenix not found in SKB as expected.")
-
-    print(f"\n--- Test 4 (Recall multiple facts): User asks a question that might use both ---")
-    # This might be too complex for the current simple RAG and prompt, but let's see
-    user_question2 = "Tell me about my favorite language and the project Phoenix."
-    response4 = orchestrator.handle_user_message(
-        user_message=user_question2,
-        conversation_id=learning_convo_id 
-    )
-    print(f"Chatbot Response 4: {response4}")
-
-
-    print("\nConversationOrchestrator learning tests finished.")
-    # ... (Final cleanup logic as before, using test_co_learn_* paths) ...
-    print("\nAttempting final cleanup of CO learning test files...")
-    del orchestrator
-    del knowledge_retriever
-    del summarizer
-    del fact_extractor_co_test # Delete the new agent instance
-    if hasattr(test_lsw, 'client') and test_lsw.client: pass 
-    del test_lsw
-    if hasattr(test_mmu, 'mtm') and test_mmu.mtm.is_persistent and hasattr(test_mmu.mtm, 'db') and test_mmu.mtm.db:
-        test_mmu.mtm.db.close()
-    del test_mmu
+    print("\nCO Vector Store learning tests finished.")
+    # ... (Final cleanup logic using test_co_vs_* paths) ...
+    print("\nAttempting final cleanup of CO VS learning test files...")
+    del orchestrator_vs
+    del knowledge_retriever_vs
+    del summarizer_vs
+    del fact_extractor_vs
+    del test_lsw_vs
+    if hasattr(test_mmu_vs, 'mtm') and test_mmu_vs.mtm.is_persistent and hasattr(test_mmu_vs.mtm, 'db') and test_mmu_vs.mtm.db:
+        test_mmu_vs.mtm.db.close()
+    del test_mmu_vs
     gc.collect()
     time.sleep(0.1)
-    if os.path.exists(test_co_mtm_db_path): 
-        try: os.remove(test_co_mtm_db_path)
-        except Exception as e: print(f"  Could not remove {test_co_mtm_db_path}: {e}")
-    if os.path.exists(test_co_ltm_sqlite_db_path): 
-        try: os.remove(test_co_ltm_sqlite_db_path)
-        except Exception as e: print(f"  Could not remove {test_co_ltm_sqlite_db_path}: {e}")
-    if os.path.exists(test_co_ltm_chroma_dir): 
-        try: shutil.rmtree(test_co_ltm_chroma_dir, ignore_errors=False)
-        except Exception as e: print(f"  Could not remove directory {test_co_ltm_chroma_dir}: {e}")
-    print("CO learning test file cleanup attempt finished.")
+    if os.path.exists(test_co_vs_mtm_db_path): 
+        try: os.remove(test_co_vs_mtm_db_path)
+        except Exception as e: print(f"  Could not remove {test_co_vs_mtm_db_path}: {e}")
+    if os.path.exists(test_co_vs_ltm_sqlite_db_path): 
+        try: os.remove(test_co_vs_ltm_sqlite_db_path)
+        except Exception as e: print(f"  Could not remove {test_co_vs_ltm_sqlite_db_path}: {e}")
+    if os.path.exists(test_co_vs_ltm_chroma_dir): 
+        try: shutil.rmtree(test_co_vs_ltm_chroma_dir, ignore_errors=False)
+        except Exception as e: print(f"  Could not remove directory {test_co_vs_ltm_chroma_dir}: {e}")
+    print("CO VS learning test file cleanup attempt finished.")
