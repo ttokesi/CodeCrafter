@@ -125,6 +125,8 @@ def count_tokens(text: str,
         # Prioritize direct match for your primary model
         if "gemma-3-4b-it" in ollama_model_name.lower() or "gemma3:4b-it" in ollama_model_name.lower(): # Check against common Ollama tag format
             hf_tokenizer_to_use = "google/gemma-3-4b-it"
+        elif "gemma3:1b-it" in ollama_model_name.lower() or "gemma3:1b" in ollama_model_name.lower(): # <--- ADD THIS for your 1B model
+            hf_tokenizer_to_use = "google/gemma-3-4b-it" # The 4B tokenizer should be compatible with 1B for counting
         elif "gemma" in ollama_model_name.lower(): # General gemma
              hf_tokenizer_to_use = "google/gemma-2b" # Or another general Gemma tokenizer as fallback
         elif "llama" in ollama_model_name.lower():
