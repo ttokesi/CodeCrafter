@@ -5,25 +5,30 @@ import shutil
 import time
 import gc 
 
+# Conditional imports
 if __name__ == '__main__' and __package__ is None:
     import sys
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+    
     from mmu.mmu_manager import MemoryManagementUnit
     from core.llm_service_wrapper import LLMServiceWrapper
-    from core.agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent # <--- ADD FactExtractionAgent
+    from core.agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent
+    from core.tokenizer_utils import count_tokens # <--- ADD THIS IMPORT
 else:
     from mmu.mmu_manager import MemoryManagementUnit
     from .llm_service_wrapper import LLMServiceWrapper
-    from .agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent # <--- ADD FactExtractionAgent
+    from .agents import KnowledgeRetrieverAgent, SummarizationAgent, FactExtractionAgent
+    from .tokenizer_utils import count_tokens # <--- ADD THIS IMPORT
 
-# Default configuration for the orchestrator
-DEFAULT_MAX_CONTEXT_TOKENS_APPROX = 3000 # Approximate token limit for context fed to LLM
-                                         # This needs to be less than the LLM's actual context window
-                                         # (e.g., Llama 3 8k, Gemma 8k)
-                                         # We'll use a simple word count as a proxy for now.
+# --- Constants ---
+# DEFAULT_MAX_CONTEXT_TOKENS_APPROX = 3000 # Words approx // 5
+# Replace with token-based limit. Assuming 8192 context for gemma3:4b-it-fp16 via Ollama.
+# Target prompt tokens should be less to leave room for generation.
+TARGET_MAX_PROMPT_TOKENS = 7000 # <--- NEW CONSTANT (Adjust if your assumed context window is different)
 DEFAULT_TOP_K_VECTOR_SEARCH = 3
+# --- End Constants ---
 
 class ConversationOrchestrator:
     def __init__(self, 
@@ -54,26 +59,26 @@ class ConversationOrchestrator:
         
         print("ConversationOrchestrator initialized.")
         print(f"  Default LLM model for responses: {self.default_llm_model}")
+        print(f"  Target max prompt tokens: {TARGET_MAX_PROMPT_TOKENS}") # Log the target
 
     def _build_prompt_with_context(self,
                                    conversation_id: str,
                                    user_query: str,
-                                   retrieved_knowledge: dict,
-                                   max_context_words_approx: int = DEFAULT_MAX_CONTEXT_TOKENS_APPROX // 5
-                                  ) -> list:
+                                   retrieved_knowledge: dict
+                                  ) -> list: # Return type is list of messages
         """
-        Constructs the full prompt to be sent to the LLM, incorporating:
-        - System instructions
-        - Short-Term Memory (recent conversation history)
-        - Retrieved knowledge from LTM (vector store, SKB facts)
-        - The current user query
-        Manages context length to avoid exceeding LLM limits.
+        Constructs the full prompt to be sent to the LLM, incorporating context
+        and managing total token count.
         """
-        
-        # 1. System Prompt / Instructions
-        # This needs careful crafting and iteration!
+        print("  CO: Building prompt with context...")
+        # The LLM model this prompt is being built for (to pass to count_tokens)
+        # For now, assume it's the CO's default_llm_model. If different models
+        # are used for different tasks within CO, this would need to be dynamic.
+        target_ollama_model_for_tokens = self.default_llm_model
+
+        # 1. System Prompt
         system_message_content = (
-            "You are a helpful and knowledgeable AI assistant. "
+            "You are a helpful and knowledgeable AI assistant. " 
             "Your primary goal is to answer the user's questions accurately and coherently. "
             "You have access to your short-term conversation memory and relevant information retrieved from your long-term knowledge base. "
             "Prioritize using the 'RETRIEVED KNOWLEDGE CONTEXT' section to answer if it's relevant. "
@@ -82,82 +87,128 @@ class ConversationOrchestrator:
             "Do not invent facts or information. Be concise unless asked for detail. "
             "If you use information from the 'RETRIEVED KNOWLEDGE CONTEXT', try to subtly indicate that you are recalling specific information (e.g., 'Based on what we discussed earlier about X...' or 'I found some information relating to Y...')."
         )
-        # For now, we'll format the prompt as a single string for LSW's generate_chat_completion with system/user roles.
-        # Later, we might use LSW's chat messages format more directly if needed.
+        system_tokens = count_tokens(system_message_content, target_ollama_model_for_tokens)
+        current_total_tokens = system_tokens
+        print(f"    Tokens - System message: {system_tokens}")
 
-        # 2. Short-Term Memory (STM)
-        stm_history_turns = self.mmu.get_stm_history() # List of {"role": ..., "content": ...}
+        messages = [{"role": "system", "content": system_message_content}]
+
+        # 2. Retrieved Knowledge Context (LTM) - Prioritize this after system message
+        # This section will try to add LTM results one by one until limit is approached.
+        # More sophisticated ranking could be added here.
+        knowledge_context_str_parts = []
         
-        # 3. Retrieved Knowledge Context (LTM)
-        # We need to format and potentially condense this.
-        context_parts = []
-        
-        # Add SKB facts
+        # Add SKB facts first (often more precise)
         if retrieved_knowledge.get("skb_fact_results"):
-            context_parts.append("Retrieved Facts from Knowledge Base:")
-            for fact in retrieved_knowledge["skb_fact_results"][:3]: # Limit facts displayed
-                context_parts.append(f"  - Fact: {fact.get('subject')} {fact.get('predicate')} {fact.get('object')}.")
+            # knowledge_context_str_parts.append("Retrieved Facts from Knowledge Base:") # Title token cost
+            for fact_idx, fact in enumerate(retrieved_knowledge["skb_fact_results"][:3]): # Still limit to top 3 SKB for now
+                fact_str = f"Fact: {fact.get('subject')} {fact.get('predicate')} {fact.get('object')}."
+                fact_tokens = count_tokens(fact_str, target_ollama_model_for_tokens)
+                if current_total_tokens + fact_tokens < TARGET_MAX_PROMPT_TOKENS:
+                    if not knowledge_context_str_parts: # Add title only if we add content
+                         title = "Retrieved Facts from Knowledge Base:"
+                         knowledge_context_str_parts.append(title)
+                         current_total_tokens += count_tokens(title, target_ollama_model_for_tokens)
+                    knowledge_context_str_parts.append(f"  - {fact_str}")
+                    current_total_tokens += fact_tokens
+                    print(f"    Tokens - Added SKB Fact {fact_idx+1} ({fact_tokens} tokens). Cumulative: {current_total_tokens}")
+                else:
+                    print(f"    Tokens - SKIPPING SKB Fact {fact_idx+1} (would exceed limit).")
+                    break 
         
         # Add Vector Store results
         if retrieved_knowledge.get("vector_results"):
-            context_parts.append("\nRetrieved Similar Information from Past Interactions/Documents:")
-            for res in retrieved_knowledge["vector_results"][:DEFAULT_TOP_K_VECTOR_SEARCH]: # Already limited by top_k in search
-                # For very long text_chunks, we might want to summarize them here using self.summarizer
-                # For now, just take the chunk.
-                context_parts.append(f"  - From source (metadata: {res.get('metadata', {})}): \"{res.get('text_chunk', '')}\"")
-        
-        retrieved_knowledge_str = "\n".join(context_parts)
+            # temp_vector_title_added = False
+            for res_idx, res in enumerate(retrieved_knowledge["vector_results"][:DEFAULT_TOP_K_VECTOR_SEARCH]):
+                # Future: If res.get('text_chunk') is very long, summarize it first using self.summarizer
+                # For now, we might truncate it or include as is if it fits.
+                # Let's try to include a portion if it's too long.
+                chunk_text = res.get('text_chunk', '')
+                # Simple truncation for now if a single chunk is massive (e.g. > 1000 tokens itself)
+                # A better way would be to summarize.
+                # max_chunk_tokens = 1000 
+                # chunk_tokens_initial = count_tokens(chunk_text, target_ollama_model_for_tokens)
+                # if chunk_tokens_initial > max_chunk_tokens:
+                #     # This is a placeholder for summarization or smarter truncation
+                #     print(f"    Tokens - Vector chunk {res_idx+1} too long ({chunk_tokens_initial}), needs summarization/truncation logic.")
+                #     # For now, just skip if too long to avoid complex logic here.
+                #     # Or, try to take a prefix, but even that needs token counting.
+                #     continue # Or implement truncation to X tokens.
 
-        # 4. Construct the prompt messages list
-        # This is a simplified approach. A more robust context manager would count tokens.
-        # For now, we'll use word counts as a rough proxy for context length.
-        
-        messages = [{"role": "system", "content": system_message_content}]
-        
-        current_word_count = len(system_message_content.split())
-        
-        knowledge_word_count = 0 # Initialize to 0
-        if retrieved_knowledge_str: 
-            knowledge_word_count = len(retrieved_knowledge_str.split()) # Assign if there's knowledge
-            # The conditional check for length warning was inside this if, which is fine
-            if current_word_count + knowledge_word_count < max_context_words_approx:
-                pass 
-            else:
-                print(f"  CO: Warning - Retrieved knowledge too long ({knowledge_word_count} words), might be truncated or omitted. Max approx words: {max_context_words_approx}")
+                res_str = f"From source (metadata: {res.get('metadata', {})}): \"{chunk_text}\""
+                res_tokens = count_tokens(res_str, target_ollama_model_for_tokens)
 
-        # Add STM history, newest first, until context window is nearly full
-        # (Actually, standard is oldest relevant STM first, then newer ones)
-        # Add STM history
-        temp_history_str_parts = []
-        # The logic for relevant_stm_for_prompt I added in the previous step:
-        relevant_stm_for_prompt = stm_history_turns
-        if stm_history_turns: # Ensure stm_history_turns is not empty before accessing last element
-            last_turn = stm_history_turns[-1]
-            if last_turn.get("role") == "user" and last_turn.get("content") == user_query:
-                relevant_stm_for_prompt = stm_history_turns[:-1]
+                if current_total_tokens + res_tokens < TARGET_MAX_PROMPT_TOKENS:
+                    if not knowledge_context_str_parts or "Retrieved Similar Information" not in knowledge_context_str_parts[-1 if knowledge_context_str_parts and "Fact" in knowledge_context_str_parts[0] else 0]: # Add title if needed
+                        title = "\nRetrieved Similar Information from Past Interactions/Documents:"
+                        knowledge_context_str_parts.append(title)
+                        current_total_tokens += count_tokens(title, target_ollama_model_for_tokens)
+                    knowledge_context_str_parts.append(f"  - {res_str}")
+                    current_total_tokens += res_tokens
+                    print(f"    Tokens - Added Vector Result {res_idx+1} ({res_tokens} tokens). Cumulative: {current_total_tokens}")
+                else:
+                    print(f"    Tokens - SKIPPING Vector Result {res_idx+1} (would exceed limit).")
+                    break
+        
+        retrieved_knowledge_prompt_str = "\n".join(knowledge_context_str_parts)
+        # Note: current_total_tokens already includes tokens for retrieved_knowledge_prompt_str parts
 
-        for turn in reversed(relevant_stm_for_prompt): 
+        # 3. Short-Term Memory (STM) - Add recent turns, newest first from available STM
+        #    but ensure they are presented in chronological order in the prompt.
+        stm_history_turns = self.mmu.get_stm_history()
+        stm_prompt_parts = []
+
+        # STM usually includes the current user query as the last item if add_stm_turn was called before prompt building.
+        # We want to build history *before* the current query for the prompt.
+        stm_for_prompt_build = stm_history_turns
+        if stm_for_prompt_build and stm_for_prompt_build[-1].get("role") == "user" and stm_for_prompt_build[-1].get("content") == user_query:
+            stm_for_prompt_build = stm_history_turns[:-1] # Exclude current user query
+
+        for turn_idx, turn in enumerate(reversed(stm_for_prompt_build)):
             turn_str = f"{turn['role'].capitalize()}: {turn['content']}"
-            turn_word_count = len(turn_str.split())
-            # Now knowledge_word_count is always defined (0 if no knowledge)
-            if current_word_count + knowledge_word_count + turn_word_count + len(user_query.split()) < max_context_words_approx:
-                temp_history_str_parts.insert(0, turn_str) 
-                current_word_count += turn_word_count
-            else:
-                break 
-        
-        full_user_prompt_content = ""
-        if temp_history_str_parts:
-            full_user_prompt_content += "Relevant Conversation History:\n" + "\n".join(temp_history_str_parts) + "\n\n"
+            turn_tokens = count_tokens(turn_str, target_ollama_model_for_tokens)
             
-        # Check if retrieved_knowledge_str should be added (it might be empty)
-        if retrieved_knowledge_str and (len(full_user_prompt_content.split()) + knowledge_word_count + len(user_query.split()) < max_context_words_approx):
-            full_user_prompt_content += "RETRIEVED KNOWLEDGE CONTEXT:\n" + retrieved_knowledge_str + "\n\n"
+            # Check if adding this turn (plus user_query tokens) exceeds the limit
+            # User query tokens will be added last, so reserve space for them.
+            user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens) # Calculate once
+            if current_total_tokens + turn_tokens + user_query_tokens < TARGET_MAX_PROMPT_TOKENS:
+                stm_prompt_parts.insert(0, turn_str) # Insert at beginning to maintain chronological order
+                current_total_tokens += turn_tokens
+                print(f"    Tokens - Added STM Turn (from end) {len(stm_for_prompt_build)-turn_idx} ({turn_tokens} tokens). Cumulative: {current_total_tokens}")
+            else:
+                print(f"    Tokens - SKIPPING older STM Turn (from end) {len(stm_for_prompt_build)-turn_idx} (would exceed limit).")
+                break
         
-        full_user_prompt_content += f"User Query: {user_query}"
-        messages.append({"role": "user", "content": full_user_prompt_content})
+        stm_history_prompt_str = "\n".join(stm_prompt_parts)
+        # Note: current_total_tokens already includes tokens for stm_history_prompt_str
+
+        # 4. Construct final user message content
+        full_user_prompt_content_parts = []
+        if stm_history_prompt_str:
+            full_user_prompt_content_parts.append("Relevant Conversation History:")
+            full_user_prompt_content_parts.append(stm_history_prompt_str)
         
-        return messages # Return the list of messages
+        if retrieved_knowledge_prompt_str:
+            if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n") # Add separator
+            full_user_prompt_content_parts.append("RETRIEVED KNOWLEDGE CONTEXT:")
+            full_user_prompt_content_parts.append(retrieved_knowledge_prompt_str)
+
+        if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n\n") # Add separator
+        full_user_prompt_content_parts.append(f"User Query: {user_query}")
+        
+        final_user_content = "".join(full_user_prompt_content_parts)
+        user_query_tokens_final = count_tokens(final_user_content, target_ollama_model_for_tokens) # This is the token count of the whole user part
+        
+        # This final check isn't perfect because current_total_tokens was for system + LTM + STM strings separately.
+        # A more accurate way is to tokenize the whole user content string.
+        # For now, this is an estimate.
+        final_prompt_tokens_estimate = system_tokens + user_query_tokens_final
+        print(f"    Tokens - Final User Content Block: {user_query_tokens_final}")
+        print(f"  CO: Estimated total prompt tokens: {final_prompt_tokens_estimate} (Target: {TARGET_MAX_PROMPT_TOKENS})")
+
+        messages.append({"role": "user", "content": final_user_content})
+        
+        return messages
 
 
     def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
