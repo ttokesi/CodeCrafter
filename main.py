@@ -27,7 +27,7 @@ MMU_LTM_CHROMA_DIR = 'data/ltm_vector_store'
 
 # LSW Configuration
 LSW_OLLAMA_HOST = "http://localhost:11434"
-LSW_DEFAULT_CHAT_MODEL = "gemma3:1b-it-fp16" # Ensure this model is pulled in Ollama
+LSW_DEFAULT_CHAT_MODEL = "gemma3:12b-it-fp16" # Ensure this model is pulled in Ollama
 LSW_DEFAULT_EMBEDDING_OLLAMA = "nomic-embed-text" # Ensure pulled
 LSW_DEFAULT_EMBEDDING_ST = "all-MiniLM-L6-v2"
 
