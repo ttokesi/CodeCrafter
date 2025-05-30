@@ -4,6 +4,7 @@ import shutil
 import time   
 import gc     # For test cleanup
 import json   # For parsing LLM's structured output
+import re
 
 # Conditional import for MMU and LSW based on execution context
 if __name__ == '__main__' and __package__ is None:
@@ -40,43 +41,19 @@ class KnowledgeRetrieverAgent:
                          search_vector_store: bool = True,
                          search_skb_facts: bool = True,
                          top_k_vector: int = 3,
+                         # Allow CO to pass an explicit user_id if we support multi-user in future
+                         # For now, it's not used by KRA but good for API consistency.
+                         user_id: str = "default_user", 
                          skb_subject: str = None,
                          skb_predicate: str = None,
                          skb_object: str = None) -> dict:
-        """
-        Searches for knowledge relevant to the query_text from configured LTM sources.
-
-        Args:
-            query_text (str): The primary text query for semantic search in the vector store.
-                              Also used to derive terms for SKB search if specific skb args are not given.
-            search_vector_store (bool): Whether to search the LTM Vector Store.
-            search_skb_facts (bool): Whether to search the LTM Structured Knowledge Base (facts table).
-            top_k_vector (int): Number of results to retrieve from the vector store.
-            skb_subject (str, optional): Specific subject to search for in SKB facts.
-                                         If None and search_skb_facts is True, might try to infer from query_text (simplistic for now).
-            skb_predicate (str, optional): Specific predicate for SKB facts.
-            skb_object (str, optional): Specific object for SKB facts.
-
-        Returns:
-            dict: A dictionary containing results from different sources.
-                  Example: {
-                      "vector_results": [
-                          {"text_chunk": "...", "metadata": {...}, "distance": 0.X}, ...
-                      ],
-                      "skb_fact_results": [
-                          {"subject": "...", "predicate": "...", "object": "...", ...}, ...
-                      ]
-                  }
-        """
         results = {
             "vector_results": [],
             "skb_fact_results": []
         }
-        #print(f"\nKnowledgeRetrieverAgent: Searching for query: '{query_text}'")
-
-        # 1. Search Vector Store (Semantic Search)
+        
         if search_vector_store:
-            print(f"  - Performing semantic search in LTM Vector Store (top_k={top_k_vector})...")
+            # ... (vector search logic as before - no changes here) ...
             try:
                 vector_search_results = self.mmu.semantic_search_ltm_vector_store(query_text=query_text, top_k=top_k_vector)
                 if vector_search_results: results["vector_results"] = vector_search_results
@@ -85,6 +62,7 @@ class KnowledgeRetrieverAgent:
         if search_skb_facts:
             found_skb_facts_dict = {} 
 
+            # --- STRATEGY 1: Targeted S-P-O Search (if provided) ---
             if skb_subject or skb_predicate or skb_object:
                 print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
                 try:
@@ -96,54 +74,74 @@ class KnowledgeRetrieverAgent:
                         if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
                 except Exception as e:
                     print(f"    Error during targeted SKB fact search: {e}")
-            
-            if query_text:
-                # Basic stop word filtering AND PUNCTUATION STRIPPING
-                stop_words = ["what", "is", "my", "me", "i", "do", "you", "the", "a", "and", "tell", "about", "can", "does", "was", "are", "were", "of", "for", "on", "in", "at", "it"]
-                # Define characters to strip (punctuation)
-                punctuation_to_strip = str.maketrans('', '', '.,?!;:"()[]{}') # string.punctuation without '
 
+            # --- STRATEGY 2: Pattern-Based Search for Common Questions (if no specific S-P-O above) ---
+            # This runs if specific skb_subject/predicate/object were NOT provided, or can be additive.
+            # For now, let's make it run if specific S,P,O are not set by the caller.
+            # We might want to make this logic more sophisticated later, e.g. always try patterns.
+            if query_text and not (skb_subject or skb_predicate or skb_object):
+                print(f"  KRA_DEBUG: Attempting pattern-based SKB search for query: '{query_text}'")
+                # Pattern 1: "What is my X?" -> search for subject "user X" or "user's X"
+                match_my_x = re.search(r"what is my ([\w\s]+)\??", query_text.lower())
+                if match_my_x:
+                    entity = match_my_x.group(1).strip()
+                    # Search for canonical subjects our FactExtractor might create
+                    potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"] # Handle plurals simply
+                    for potential_subject in potential_subjects:
+                        print(f"    KRA_DEBUG: Pattern 'What is my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
+                        facts_pattern = self.mmu.get_ltm_facts(subject=f"%{potential_subject}%", predicate="is") # Often "is"
+                        for fact in facts_pattern:
+                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+                        if found_skb_facts_dict: break # Stop if we found something with first pattern
+
+                # Pattern 2: "Do you remember my X?" or "Do you know my X?"
+                # -> search for subject "user X" or "user's X"
+                match_remember_my_x = re.search(r"do you (?:remember|know) my ([\w\s]+)\??", query_text.lower())
+                if not found_skb_facts_dict and match_remember_my_x: # Only if previous pattern didn't yield
+                    entity = match_remember_my_x.group(1).strip()
+                    potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"]
+                    for potential_subject in potential_subjects:
+                        print(f"    KRA_DEBUG: Pattern 'Do you remember my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
+                        facts_pattern = self.mmu.get_ltm_facts(subject=f"%{potential_subject}%", predicate="is")
+                        for fact in facts_pattern:
+                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+                        if found_skb_facts_dict: break
+                
+                # Add more patterns here as needed for common question types...
+                # Example: "Where is X?" -> search subject "X", predicate "location is" OR "is located in"
+
+            # --- STRATEGY 3: General Keyword-Based Search (if previous strategies found little or as a fallback) ---
+            # Run this if pattern search found nothing or to augment it.
+            if query_text: # and not found_skb_facts_dict: # Optional: only run if patterns failed
+                stop_words = ["what", "is", "my", "me", "i", "do", "you", "the", "a", "and", "tell", "about", "can", "does", "was", "are", "were", "of", "for", "on", "in", "at", "it"]
+                punctuation_to_strip = str.maketrans('', '', '.,?!;:"()[]{}')
                 raw_keywords = query_text.lower().split()
                 keywords = []
                 for kw_raw in raw_keywords:
-                    kw_cleaned = kw_raw.translate(punctuation_to_strip) # Strip punctuation
-                    if len(kw_cleaned) > 2 and kw_cleaned not in stop_words:
+                    kw_cleaned = kw_raw.translate(punctuation_to_strip)
+                    if len(kw_cleaned) > 1 and kw_cleaned not in stop_words: # Allow 2-letter keywords if not stop words
                         keywords.append(kw_cleaned)
                 
-                print(f"  KRA_DEBUG: Performing keyword-based SKB search for query: '{query_text}'. Cleaned Keywords: {keywords}")
-
-                for keyword in set(keywords): 
-                    if not keyword: continue
-                    print(f"    KRA_DEBUG: Querying SKB with keyword '{keyword}'...")
-                    try:
-                        # Search keyword in subject
-                        print(f"      KRA_DEBUG: ...in subject LIKE '%{keyword}%'")
-                        facts_subj = self.mmu.get_ltm_facts(subject=f"%{keyword}%")
-                        if facts_subj: print(f"        KRA_DEBUG: Found {len(facts_subj)} in subject for '{keyword}'.")
-                        for fact in facts_subj:
-                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
-                        
-                        # Search keyword in object
-                        print(f"      KRA_DEBUG: ...in object LIKE '%{keyword}%'")
-                        facts_obj = self.mmu.get_ltm_facts(object_value=f"%{keyword}%") 
-                        if facts_obj: print(f"        KRA_DEBUG: Found {len(facts_obj)} in object for '{keyword}'.")
-                        for fact in facts_obj:
-                            if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
-
-                        print(f"      KRA_DEBUG: ...in predicate LIKE '%{keyword}%'")
-                        facts_pred = self.mmu.get_ltm_facts(predicate=f"%{keyword}%")
-                        if facts_pred: print(f"        KRA_DEBUG: Found {len(facts_pred)} in predicate for '{keyword}'.")
-                        for fact in facts_pred:
-                            if 'fact_id' in fact: # Ensure fact_id exists to use as key
-                                found_skb_facts_dict[fact['fact_id']] = fact    
-                    
-                    except Exception as e:
-                        print(f"    Error during keyword-based SKB fact search for '{keyword}': {e}")
+                if keywords: # Only print if there are actual keywords to search
+                    print(f"  KRA_DEBUG: Performing general keyword-based SKB search. Cleaned Keywords: {keywords}")
+                    for keyword in set(keywords):
+                        if not keyword: continue
+                        # print(f"    KRA_DEBUG: Querying SKB with general keyword '{keyword}'...") # Can be verbose
+                        try:
+                            for field_to_search in ["subject", "predicate", "object_value"]:
+                                query_params = {field_to_search: f"%{keyword}%"}
+                                # print(f"      KRA_DEBUG: ...in {field_to_search} LIKE '%{keyword}%'")
+                                facts_kw = self.mmu.get_ltm_facts(**query_params)
+                                # if facts_kw: print(f"        KRA_DEBUG: Found {len(facts_kw)} in {field_to_search} for '{keyword}'.")
+                                for fact in facts_kw:
+                                    if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
+                        except Exception as e:
+                            print(f"    Error during general keyword-based SKB fact search for '{keyword}': {e}")
             
             results["skb_fact_results"] = list(found_skb_facts_dict.values())
-            if results["skb_fact_results"]: # This print was there and seems to have been missing in the latest output
+            if results["skb_fact_results"]:
                 print(f"  KRA: Found {len(results['skb_fact_results'])} unique fact(s) from SKB based on query/params.")
-            else: # If found_skb_facts_dict is still empty
+            else:
                 print(f"  KRA: No unique facts found in SKB for this query/params.")
         
         return results
