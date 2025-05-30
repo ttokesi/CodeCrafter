@@ -29,6 +29,9 @@ else:
 TARGET_MAX_PROMPT_TOKENS = 7000 # <--- NEW CONSTANT (Adjust if your assumed context window is different)
 DEFAULT_TOP_K_VECTOR_SEARCH = 3
 MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE = 10 # User statements longer than this may be stored
+# NEW CONSTANT for summarizing LTM chunks
+MAX_TOKENS_PER_LTM_VECTOR_CHUNK = 500 # If a VS chunk exceeds this, try to summarize it
+TARGET_SUMMARY_TOKENS_FOR_LTM_CHUNK = 150 # Target length for the summary of a long chunk
 # --- End Constants ---
 
 class ConversationOrchestrator:
@@ -62,6 +65,8 @@ class ConversationOrchestrator:
         print(f"  Default LLM model for responses: {self.default_llm_model}")
         print(f"  Target max prompt tokens: {TARGET_MAX_PROMPT_TOKENS}")
         print(f"  Min tokens for user statement to be considered for Vector Store: {MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE}")
+        print(f"  Max tokens per LTM vector chunk (before summary): {MAX_TOKENS_PER_LTM_VECTOR_CHUNK}")
+        print(f"  Target summary tokens for long LTM chunk: {TARGET_SUMMARY_TOKENS_FOR_LTM_CHUNK}")
 
     def _build_prompt_with_context(self,
                                    conversation_id: str,
@@ -77,6 +82,7 @@ class ConversationOrchestrator:
         # For now, assume it's the CO's default_llm_model. If different models
         # are used for different tasks within CO, this would need to be dynamic.
         target_ollama_model_for_tokens = self.default_llm_model
+        summarization_llm_model = self.summarizer.default_model_name
 
         # 1. System Prompt
         system_message_content = (
@@ -100,17 +106,23 @@ class ConversationOrchestrator:
         # More sophisticated ranking could be added here.
         knowledge_context_str_parts = []
         
-        # Add SKB facts first (often more precise)
+        # Add SKB facts (assuming these are generally short)
         if retrieved_knowledge.get("skb_fact_results"):
-            # knowledge_context_str_parts.append("Retrieved Facts from Knowledge Base:") # Title token cost
-            for fact_idx, fact in enumerate(retrieved_knowledge["skb_fact_results"][:3]): # Still limit to top 3 SKB for now
+            added_skb_title = False
+            for fact_idx, fact in enumerate(retrieved_knowledge["skb_fact_results"][:3]): 
                 fact_str = f"Fact: {fact.get('subject')} {fact.get('predicate')} {fact.get('object')}."
                 fact_tokens = count_tokens(fact_str, target_ollama_model_for_tokens)
-                if current_total_tokens + fact_tokens < TARGET_MAX_PROMPT_TOKENS:
-                    if not knowledge_context_str_parts: # Add title only if we add content
-                         title = "Retrieved Facts from Knowledge Base:"
+                
+                title_tokens = 0
+                if not added_skb_title:
+                    title = "Retrieved Facts from Knowledge Base:"
+                    title_tokens = count_tokens(title, target_ollama_model_for_tokens)
+
+                if current_total_tokens + title_tokens + fact_tokens < TARGET_MAX_PROMPT_TOKENS:
+                    if not added_skb_title:
                          knowledge_context_str_parts.append(title)
-                         current_total_tokens += count_tokens(title, target_ollama_model_for_tokens)
+                         current_total_tokens += title_tokens
+                         added_skb_title = True
                     knowledge_context_str_parts.append(f"  - {fact_str}")
                     current_total_tokens += fact_tokens
                     print(f"    Tokens - Added SKB Fact {fact_idx+1} ({fact_tokens} tokens). Cumulative: {current_total_tokens}")
@@ -118,33 +130,42 @@ class ConversationOrchestrator:
                     print(f"    Tokens - SKIPPING SKB Fact {fact_idx+1} (would exceed limit).")
                     break 
         
-        # Add Vector Store results
+        # Add Vector Store results, with summarization for long chunks
         if retrieved_knowledge.get("vector_results"):
-            # temp_vector_title_added = False
+            added_vs_title = False
             for res_idx, res in enumerate(retrieved_knowledge["vector_results"][:DEFAULT_TOP_K_VECTOR_SEARCH]):
-                # Future: If res.get('text_chunk') is very long, summarize it first using self.summarizer
-                # For now, we might truncate it or include as is if it fits.
-                # Let's try to include a portion if it's too long.
-                chunk_text = res.get('text_chunk', '')
-                # Simple truncation for now if a single chunk is massive (e.g. > 1000 tokens itself)
-                # A better way would be to summarize.
-                # max_chunk_tokens = 1000 
-                # chunk_tokens_initial = count_tokens(chunk_text, target_ollama_model_for_tokens)
-                # if chunk_tokens_initial > max_chunk_tokens:
-                #     # This is a placeholder for summarization or smarter truncation
-                #     print(f"    Tokens - Vector chunk {res_idx+1} too long ({chunk_tokens_initial}), needs summarization/truncation logic.")
-                #     # For now, just skip if too long to avoid complex logic here.
-                #     # Or, try to take a prefix, but even that needs token counting.
-                #     continue # Or implement truncation to X tokens.
+                chunk_text_to_use = res.get('text_chunk', '')
+                original_chunk_tokens = count_tokens(chunk_text_to_use, target_ollama_model_for_tokens)
+                
+                # --- NEW: Summarize if too long ---
+                if original_chunk_tokens > MAX_TOKENS_PER_LTM_VECTOR_CHUNK:
+                    print(f"    Tokens - Vector chunk {res_idx+1} is long ({original_chunk_tokens} tokens). Attempting summarization...")
+                    summary = self.summarizer.summarize_text(
+                        text_to_summarize=chunk_text_to_use,
+                        model_name=summarization_llm_model, # Use summarizer's default or a specific one
+                        max_summary_length=TARGET_SUMMARY_TOKENS_FOR_LTM_CHUNK 
+                    )
+                    if summary:
+                        chunk_text_to_use = f"[Summary of a longer document]: {summary}" # Prepend context
+                        print(f"      Summarized chunk to ~{count_tokens(chunk_text_to_use, target_ollama_model_for_tokens)} tokens.")
+                    else:
+                        print(f"      Summarization failed for chunk {res_idx+1}. Using original (might be skipped).")
+                        # Keep original chunk_text_to_use if summarization fails
+                # --- End Summarization ---
 
-                res_str = f"From source (metadata: {res.get('metadata', {})}): \"{chunk_text}\""
+                res_str = f"From source (metadata: {res.get('metadata', {})}): \"{chunk_text_to_use}\""
                 res_tokens = count_tokens(res_str, target_ollama_model_for_tokens)
+                
+                title_tokens = 0
+                if not added_vs_title:
+                    title = "\nRetrieved Similar Information from Past Interactions/Documents:"
+                    title_tokens = count_tokens(title, target_ollama_model_for_tokens)
 
-                if current_total_tokens + res_tokens < TARGET_MAX_PROMPT_TOKENS:
-                    if not knowledge_context_str_parts or "Retrieved Similar Information" not in knowledge_context_str_parts[-1 if knowledge_context_str_parts and "Fact" in knowledge_context_str_parts[0] else 0]: # Add title if needed
-                        title = "\nRetrieved Similar Information from Past Interactions/Documents:"
+                if current_total_tokens + title_tokens + res_tokens < TARGET_MAX_PROMPT_TOKENS:
+                    if not added_vs_title:
                         knowledge_context_str_parts.append(title)
-                        current_total_tokens += count_tokens(title, target_ollama_model_for_tokens)
+                        current_total_tokens += title_tokens
+                        added_vs_title = True
                     knowledge_context_str_parts.append(f"  - {res_str}")
                     current_total_tokens += res_tokens
                     print(f"    Tokens - Added Vector Result {res_idx+1} ({res_tokens} tokens). Cumulative: {current_total_tokens}")
@@ -153,28 +174,22 @@ class ConversationOrchestrator:
                     break
         
         retrieved_knowledge_prompt_str = "\n".join(knowledge_context_str_parts)
-        # Note: current_total_tokens already includes tokens for retrieved_knowledge_prompt_str parts
-
-        # 3. Short-Term Memory (STM) - Add recent turns, newest first from available STM
-        #    but ensure they are presented in chronological order in the prompt.
+    
+        # STM History (logic as before, but now respecting token counts more accurately)
         stm_history_turns = self.mmu.get_stm_history()
         stm_prompt_parts = []
-
-        # STM usually includes the current user query as the last item if add_stm_turn was called before prompt building.
-        # We want to build history *before* the current query for the prompt.
+        user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens) # Calculate once
+        
         stm_for_prompt_build = stm_history_turns
         if stm_for_prompt_build and stm_for_prompt_build[-1].get("role") == "user" and stm_for_prompt_build[-1].get("content") == user_query:
-            stm_for_prompt_build = stm_history_turns[:-1] # Exclude current user query
+            stm_for_prompt_build = stm_history_turns[:-1]
 
         for turn_idx, turn in enumerate(reversed(stm_for_prompt_build)):
             turn_str = f"{turn['role'].capitalize()}: {turn['content']}"
             turn_tokens = count_tokens(turn_str, target_ollama_model_for_tokens)
             
-            # Check if adding this turn (plus user_query tokens) exceeds the limit
-            # User query tokens will be added last, so reserve space for them.
-            user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens) # Calculate once
             if current_total_tokens + turn_tokens + user_query_tokens < TARGET_MAX_PROMPT_TOKENS:
-                stm_prompt_parts.insert(0, turn_str) # Insert at beginning to maintain chronological order
+                stm_prompt_parts.insert(0, turn_str)
                 current_total_tokens += turn_tokens
                 print(f"    Tokens - Added STM Turn (from end) {len(stm_for_prompt_build)-turn_idx} ({turn_tokens} tokens). Cumulative: {current_total_tokens}")
             else:
@@ -182,36 +197,39 @@ class ConversationOrchestrator:
                 break
         
         stm_history_prompt_str = "\n".join(stm_prompt_parts)
-        # Note: current_total_tokens already includes tokens for stm_history_prompt_str
 
         # 4. Construct final user message content
         full_user_prompt_content_parts = []
         if stm_history_prompt_str:
             full_user_prompt_content_parts.append("Relevant Conversation History:")
             full_user_prompt_content_parts.append(stm_history_prompt_str)
-        
         if retrieved_knowledge_prompt_str:
-            if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n") # Add separator
+            if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n") 
             full_user_prompt_content_parts.append("RETRIEVED KNOWLEDGE CONTEXT:")
             full_user_prompt_content_parts.append(retrieved_knowledge_prompt_str)
-
-        if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n\n") # Add separator
+        if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n\n") 
         full_user_prompt_content_parts.append(f"User Query: {user_query}")
-        
         final_user_content = "".join(full_user_prompt_content_parts)
-        user_query_tokens_final = count_tokens(final_user_content, target_ollama_model_for_tokens) # This is the token count of the whole user part
         
-        # This final check isn't perfect because current_total_tokens was for system + LTM + STM strings separately.
-        # A more accurate way is to tokenize the whole user content string.
-        # For now, this is an estimate.
-        final_prompt_tokens_estimate = system_tokens + user_query_tokens_final
-        print(f"    Tokens - Final User Content Block: {user_query_tokens_final}")
-        print(f"  CO: Estimated total prompt tokens: {final_prompt_tokens_estimate} (Target: {TARGET_MAX_PROMPT_TOKENS})")
+        # Recalculate total tokens based on final assembled prompt parts for user message
+        # (System message is separate)
+        final_user_content_tokens = count_tokens(final_user_content, target_ollama_model_for_tokens)
+        final_prompt_total_tokens = system_tokens + final_user_content_tokens
+        
+        print(f"    Tokens - Final User Content Block: {final_user_content_tokens}")
+        print(f"  CO: Final total prompt tokens: {final_prompt_total_tokens} (Target: {TARGET_MAX_PROMPT_TOKENS})")
+
+        # Defensive check: if somehow we still went over, we might need to truncate final_user_content
+        # For now, we rely on the iterative building to prevent this.
+        if final_prompt_total_tokens > TARGET_MAX_PROMPT_TOKENS:
+            print(f"  CO: WARNING - Final prompt tokens ({final_prompt_total_tokens}) slightly exceeded target. This might indicate a flaw in iterative counting or very large user query.")
+            # Simplistic truncation of user content if it happens - not ideal
+            # A better approach would be more careful iterative building or summarizing the user_content block itself
+            # This part is complex to do perfectly without re-tokenizing many times.
+            # For now, this warning is key.
 
         messages.append({"role": "user", "content": final_user_content})
-        
         return messages
-
 
     def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
         if not user_message.strip(): return "Please say something!"
@@ -344,108 +362,133 @@ class ConversationOrchestrator:
         return assistant_response_text
 
 if __name__ == "__main__":
-    print("--- Testing CO with Fact Extraction & Vector Store Learning ---")
+    print("--- Testing CO with Context Summarization ---")
 
     # Test paths (use new ones to ensure fresh LTM for this specific test)
-    test_co_vs_ltm_sqlite_db_path = 'test_co_vs_learn_ltm_sqlite.db'
-    test_co_vs_ltm_chroma_dir = 'test_co_vs_learn_ltm_chroma'
-    test_co_vs_mtm_db_path = 'test_co_vs_learn_mtm_store.json'
+    test_co_sum_ltm_sqlite_db_path = 'test_co_sum_ltm_sqlite.db'
+    test_co_sum_ltm_chroma_dir = 'test_co_sum_ltm_chroma'
+    test_co_sum_mtm_db_path = 'test_co_sum_mtm_store.json'
 
     # Cleanup
-    if os.path.exists(test_co_vs_mtm_db_path): os.remove(test_co_vs_mtm_db_path)
-    if os.path.exists(test_co_vs_ltm_sqlite_db_path): os.remove(test_co_vs_ltm_sqlite_db_path)
-    if os.path.exists(test_co_vs_ltm_chroma_dir): shutil.rmtree(test_co_vs_ltm_chroma_dir)
+    if os.path.exists(test_co_sum_mtm_db_path): os.remove(test_co_sum_mtm_db_path)
+    if os.path.exists(test_co_sum_ltm_sqlite_db_path): os.remove(test_co_sum_ltm_sqlite_db_path)
+    if os.path.exists(test_co_sum_ltm_chroma_dir): shutil.rmtree(test_co_sum_ltm_chroma_dir)
 
-    test_mmu_vs = None # Use unique names for test instances
-    test_lsw_vs = None
-    knowledge_retriever_vs = None
-    summarizer_vs = None
-    fact_extractor_vs = None
-    orchestrator_vs = None
+    # ... (Initialize MMU, LSW, Agents, Orchestrator as before, using these new paths) ...
+    # Ensure all necessary instances are created, including summarizer for CO.
+    test_mmu_sum = None
+    test_lsw_sum = None
+    knowledge_retriever_sum = None
+    summarizer_agent_sum = None # Renamed to avoid conflict if you run other agent tests
+    fact_extractor_sum = None
+    orchestrator_sum = None
 
     try:
-        print("\nInitializing MMU for CO VS learning test...")
-        test_mmu_vs = MemoryManagementUnit(
-            ltm_sqlite_db_path=test_co_vs_ltm_sqlite_db_path,
-            ltm_chroma_persist_dir=test_co_vs_ltm_chroma_dir
+        print("\nInitializing MMU for CO Summarization test...")
+        test_mmu_sum = MemoryManagementUnit(
+            ltm_sqlite_db_path=test_co_sum_ltm_sqlite_db_path,
+            ltm_chroma_persist_dir=test_co_sum_ltm_chroma_dir
         )
-        print("\nInitializing LSW for CO VS learning test...")
-        test_lsw_vs = LLMServiceWrapper(default_chat_model="gemma3:1b-it-fp16") 
-        if not test_lsw_vs.client: raise Exception("Ollama client in LSW failed.")
+        print("\nInitializing LSW for CO Summarization test...")
+        test_lsw_sum = LLMServiceWrapper(default_chat_model="gemma3:1b-it-fp16") 
+        if not test_lsw_sum.client: raise Exception("Ollama client in LSW failed.")
         
-        print("\nInitializing Agents for CO VS learning test...")
-        knowledge_retriever_vs = KnowledgeRetrieverAgent(mmu=test_mmu_vs)
-        summarizer_vs = SummarizationAgent(lsw=test_lsw_vs)
-        fact_extractor_vs = FactExtractionAgent(lsw=test_lsw_vs)
+        print("\nInitializing Agents for CO Summarization test...")
+        knowledge_retriever_sum = KnowledgeRetrieverAgent(mmu=test_mmu_sum)
+        summarizer_agent_sum = SummarizationAgent(lsw=test_lsw_sum) # CRITICAL: Use this instance
+        fact_extractor_sum = FactExtractionAgent(lsw=test_lsw_sum)
 
-        print("\nInitializing CO with Fact Extraction & VS Learning capability...")
-        orchestrator_vs = ConversationOrchestrator(
-            mmu=test_mmu_vs, lsw=test_lsw_vs,
-            knowledge_retriever=knowledge_retriever_vs,
-            summarizer=summarizer_vs, fact_extractor=fact_extractor_vs
+        print("\nInitializing CO with Summarization capability...")
+        orchestrator_sum = ConversationOrchestrator(
+            mmu=test_mmu_sum, lsw=test_lsw_sum,
+            knowledge_retriever=knowledge_retriever_sum,
+            summarizer=summarizer_agent_sum, # PASS THE CORRECT SUMMARIZER INSTANCE
+            fact_extractor=fact_extractor_sum
         )
     except Exception as e:
-        print(f"FATAL: Error during CO VS learning test environment setup: {e}")
+        print(f"FATAL: Error during CO Summarization test environment setup: {e}")
         exit()
+
+    # --- Pre-populate LTM Vector Store with a VERY LONG document ---
+    print("\nPre-populating LTM Vector Store with a long document...")
+    # Create a long string (e.g., > MAX_TOKENS_PER_LTM_VECTOR_CHUNK which is 500)
+    # Repeat a paragraph multiple times. One paragraph is ~50-70 words, ~70-100 tokens.
+    # 6-7 repetitions should exceed 500 tokens.
+    paragraph = (
+        "The study of artificial intelligence (AI) is a dynamic and rapidly evolving field that "
+        "encompasses a wide range of theories, methodologies, and applications. At its core, AI "
+        "aims to create systems capable of performing tasks that typically require human intelligence, "
+        "such as learning, problem-solving, perception, language understanding, and decision-making. "
+        "Key subfields include machine learning, natural language processing, computer vision, and robotics. "
+        "Ethical considerations are also paramount as AI capabilities advance, prompting discussions "
+        "about bias, accountability, and the societal impact of autonomous systems. "
+    ) # This paragraph is approx 95 words, likely > 100 tokens.
     
-    # --- Test Conversation Flow with Vector Store Learning ---
-    vs_learn_convo_id = "vs_learn_conv_001"
+    long_document_text = (paragraph + " ") * 7 # Repeat 7 times 
+    # This should be around 700+ tokens, exceeding MAX_TOKENS_PER_LTM_VECTOR_CHUNK (500)
 
-    print(f"\n--- Test VS 1: User makes a significant statement ---")
-    user_statement_for_vs = "The upcoming Galactic Summit on AI Ethics will feature keynote speaker Dr. Aris Thorne and will discuss the future of sentient machines."
-    # This should exceed MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE
+    # Check if LTM's vector store is usable
+    ltm_vector_store_ready_sum_test = False
+    if hasattr(test_mmu_sum.ltm, 'vector_store') and test_mmu_sum.ltm.vector_store and \
+       hasattr(test_mmu_sum.ltm.vector_store, 'collection') and test_mmu_sum.ltm.vector_store.collection and \
+       hasattr(test_mmu_sum.ltm.vector_store.collection, '_embedding_function') and \
+       test_mmu_sum.ltm.vector_store.collection._embedding_function is not None:
+        ltm_vector_store_ready_sum_test = True
+
+    if ltm_vector_store_ready_sum_test:
+        long_doc_id = "long_doc_ai_ethics_001"
+        orchestrator_sum.mmu.add_document_to_ltm_vector_store( # Use orchestrator's MMU
+            text_chunk=long_document_text,
+            metadata={"source": "ai_ethics_treatise", "topic": "AI Ethics Detailed Overview"},
+            doc_id=long_doc_id
+        )
+        print(f"  Long document (approx {count_tokens(long_document_text, orchestrator_sum.default_llm_model)} tokens) stored in Vector Store with ID: {long_doc_id}")
+        time.sleep(1) # Give Chroma a moment
+    else:
+        print("  LTM Vector Store embedding function not available. Skipping long document population for summarization test.")
+        # If VS not ready, this test won't be very effective.
+        exit() # Exit if vector store not ready, as test depends on it.
+
+
+    # --- Test Conversation Flow with Potential Summarization ---
+    sum_test_convo_id = "sum_test_conv_001"
+
+    print(f"\n--- Test SUM 1: User asks about AI Ethics (should retrieve long doc and summarize it) ---")
+    user_question_sum = "Can you tell me about the core concepts of AI ethics and its applications?"
     
-    response_vs1 = orchestrator_vs.handle_user_message(
-        user_message=user_statement_for_vs,
-        conversation_id=vs_learn_convo_id
+    response_sum1 = orchestrator_sum.handle_user_message(
+        user_message=user_question_sum,
+        conversation_id=sum_test_convo_id
     )
-    print(f"Chatbot Response VS1: {response_vs1}")
+    print(f"Chatbot Response SUM1: {response_sum1}")
+    # Expected: 
+    # - KRA retrieves the long document from Vector Store.
+    # - CO._build_prompt_with_context detects it's > MAX_TOKENS_PER_LTM_VECTOR_CHUNK.
+    # - CO calls self.summarizer.summarize_text().
+    # - A summary like "[Summary of a longer document]: ..." is included in the LLM prompt.
+    # - Bot's response uses this summarized information.
 
-    # Check Vector Store (this is an indirect check, we'd need to query it)
-    # For now, we rely on the CO's print statements:
-    # "CO: User message is significant... Storing to Vector Store."
-    # "CO: User statement stored in Vector Store with ID: ..."
-
-    print(f"\n--- Test VS 2: User asks a semantically similar question (Vector Store recall) ---")
-    # This question uses different wording but is semantically related to user_statement_for_vs
-    user_question_vs = "Tell me about the conference on machine sentience and Dr. Thorne."
-    response_vs2 = orchestrator_vs.handle_user_message(
-        user_message=user_question_vs,
-        conversation_id=vs_learn_convo_id 
-    )
-    print(f"Chatbot Response VS2: {response_vs2}")
-    # Expected: KRA should find user_statement_for_vs in Vector Store.
-    # Bot should use this retrieved context.
-
-    print(f"\n--- Test VS 3: User makes a short, non-significant statement ---")
-    user_short_statement = "Okay, thanks." # Should be less than MIN_TOKENS...
-    response_vs3 = orchestrator_vs.handle_user_message(
-        user_message=user_short_statement,
-        conversation_id=vs_learn_convo_id
-    )
-    print(f"Chatbot Response VS3: {response_vs3}")
-    # Expected: "CO: User message not stored in Vector Store (tokens: X < Y)."
-
-    print("\nCO Vector Store learning tests finished.")
-    # ... (Final cleanup logic using test_co_vs_* paths) ...
-    print("\nAttempting final cleanup of CO VS learning test files...")
-    del orchestrator_vs
-    del knowledge_retriever_vs
-    del summarizer_vs
-    del fact_extractor_vs
-    del test_lsw_vs
-    if hasattr(test_mmu_vs, 'mtm') and test_mmu_vs.mtm.is_persistent and hasattr(test_mmu_vs.mtm, 'db') and test_mmu_vs.mtm.db:
-        test_mmu_vs.mtm.db.close()
-    del test_mmu_vs
+    print("\nCO Summarization test finished.")
+    # ... (Final cleanup logic using test_co_sum_* paths) ...
+    print("\nAttempting final cleanup of CO Summarization test files...")
+    del orchestrator_sum
+    del knowledge_retriever_sum
+    del summarizer_agent_sum # Delete the summarizer instance
+    del fact_extractor_sum
+    del test_lsw_sum
+    if hasattr(test_mmu_sum, 'mtm') and test_mmu_sum.mtm.is_persistent and hasattr(test_mmu_sum.mtm, 'db') and test_mmu_sum.mtm.db:
+        test_mmu_sum.mtm.db.close()
+    del test_mmu_sum
     gc.collect()
     time.sleep(0.1)
-    if os.path.exists(test_co_vs_mtm_db_path): 
-        try: os.remove(test_co_vs_mtm_db_path)
-        except Exception as e: print(f"  Could not remove {test_co_vs_mtm_db_path}: {e}")
-    if os.path.exists(test_co_vs_ltm_sqlite_db_path): 
-        try: os.remove(test_co_vs_ltm_sqlite_db_path)
-        except Exception as e: print(f"  Could not remove {test_co_vs_ltm_sqlite_db_path}: {e}")
-    if os.path.exists(test_co_vs_ltm_chroma_dir): 
-        try: shutil.rmtree(test_co_vs_ltm_chroma_dir, ignore_errors=False)
-        except Exception as e: print(f"  Could not remove directory {test_co_vs_ltm_chroma_dir}: {e}")
-    print("CO VS learning test file cleanup attempt finished.")
+    # ... (os.remove and shutil.rmtree for test_co_sum_* files/dirs) ...
+    if os.path.exists(test_co_sum_mtm_db_path): 
+        try: os.remove(test_co_sum_mtm_db_path)
+        except Exception as e: print(f"  Could not remove {test_co_sum_mtm_db_path}: {e}")
+    if os.path.exists(test_co_sum_ltm_sqlite_db_path): 
+        try: os.remove(test_co_sum_ltm_sqlite_db_path)
+        except Exception as e: print(f"  Could not remove {test_co_sum_ltm_sqlite_db_path}: {e}")
+    if os.path.exists(test_co_sum_ltm_chroma_dir): 
+        try: shutil.rmtree(test_co_sum_ltm_chroma_dir, ignore_errors=False)
+        except Exception as e: print(f"  Could not remove directory {test_co_sum_ltm_chroma_dir}: {e}")
+    print("CO Summarization test file cleanup attempt finished.")
