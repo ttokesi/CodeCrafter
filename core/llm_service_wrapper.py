@@ -1,66 +1,49 @@
 # offline_chat_bot/core/llm_service_wrapper.py
 
 import ollama
-import time
+import time # Keep if used, otherwise can remove
 
-# Optional: For using sentence-transformers as an alternative embedding source
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-    # Define a dummy class if not available so type hints don't break
     class SentenceTransformer: 
         def __init__(self, model_name_or_path): pass
         def encode(self, sentences, **kwargs): return [] 
 
-DEFAULT_OLLAMA_HOST = "http://localhost:11434" # Default Ollama API host
-
-# Default model names - these should be models you have pulled into Ollama
-DEFAULT_CHAT_MODEL = "gemma3:1b-it-fp16" # A smaller, faster model for general chat
-DEFAULT_EMBEDDING_MODEL_OLLAMA = "nomic-embed-text" # Ollama's recommended default
-DEFAULT_EMBEDDING_MODEL_ST = "all-MiniLM-L6-v2" # A good default SentenceTransformer
+from .config_loader import get_config # <--- ADD IMPORT
 
 class LLMServiceWrapper:
-    """
-    Wraps interactions with the Ollama LLM service and local SentenceTransformer models
-    for text generation and embedding.
-    """
-    def __init__(self, ollama_host: str = DEFAULT_OLLAMA_HOST, 
-                 default_chat_model: str = DEFAULT_CHAT_MODEL,
-                 default_embedding_model_ollama: str = DEFAULT_EMBEDDING_MODEL_OLLAMA,
-                 default_embedding_model_st: str = DEFAULT_EMBEDDING_MODEL_ST):
+    def __init__(self): # <--- REMOVE PARAMETERS FROM SIGNATURE
         """
-        Initializes the LLMServiceWrapper.
-
-        Args:
-            ollama_host (str): The host address of the Ollama API.
-            default_chat_model (str): Default Ollama model to use for chat.
-            default_embedding_model_ollama (str): Default Ollama model for embeddings.
-            default_embedding_model_st (str): Default SentenceTransformer model for embeddings.
+        Initializes the LLMServiceWrapper using settings from the global configuration.
         """
-        print(f"Initializing LLMServiceWrapper with Ollama host: {ollama_host}")
-        self.ollama_host = ollama_host
-        self.default_chat_model = default_chat_model
-        self.default_embedding_model_ollama = default_embedding_model_ollama
-        self.default_embedding_model_st = default_embedding_model_st
+        config = get_config() # Load global config
+        lsw_config = config.get('lsw', {}) # Get the 'lsw' section, or empty dict if not found
+        
+        self.ollama_host = lsw_config.get('ollama_host', "http://localhost:11434")
+        self.default_chat_model = lsw_config.get('default_chat_model', "gemma3:1b-it-fp16") # Sensible fallback
+        self.default_embedding_model_ollama = lsw_config.get('default_embedding_model_ollama', "nomic-embed-text")
+        self.default_embedding_model_st = lsw_config.get('default_embedding_model_st', "all-MiniLM-L6-v2")
+        
+        print(f"Initializing LLMServiceWrapper with Ollama host: {self.ollama_host}")
+        print(f"  Default chat model: {self.default_chat_model}")
+        print(f"  Default Ollama embedding model: {self.default_embedding_model_ollama}")
+        print(f"  Default ST embedding model: {self.default_embedding_model_st}")
         
         try:
             self.client = ollama.Client(host=self.ollama_host)
-            # Test connection by listing models (can be slow if many models)
-            # self.list_local_models() # Optional: test connection on init
             print("  Ollama client initialized.")
         except Exception as e:
-            print(f"  Error initializing Ollama client: {e}. Ensure Ollama service is running at {ollama_host}.")
-            self.client = None # Mark client as unusable
-            # raise # Optionally re-raise to halt if Ollama is critical at startup
+            print(f"  Error initializing Ollama client: {e}. Ensure Ollama service is running at {self.ollama_host}.")
+            self.client = None
 
-        # Initialize SentenceTransformer model for embeddings if available and needed
         self.st_model = None
         if SENTENCE_TRANSFORMERS_AVAILABLE:
             try:
+                # The ST model name is now self.default_embedding_model_st
                 print(f"  Attempting to load SentenceTransformer model: {self.default_embedding_model_st}")
-                # This might download the model on first use if not cached
                 self.st_model = SentenceTransformer(self.default_embedding_model_st)
                 print(f"  SentenceTransformer model '{self.default_embedding_model_st}' loaded successfully.")
             except Exception as e:
@@ -222,93 +205,93 @@ class LLMServiceWrapper:
             print(f"Error: Unknown embedding source '{source}'. Choose 'ollama' or 'st'.")
             return None
 
-# --- Test Block ---
+# In offline_chat_bot/core/llm_service_wrapper.py
 if __name__ == "__main__":
-    print("--- Testing LLMServiceWrapper ---")
+    print("--- Testing LLMServiceWrapper (using values from config.yaml) ---")
 
-    # Ensure Ollama is running and you have pulled some models, e.g.:
-    # ollama pull gemma:2b
-    # ollama pull nomic-embed-text
-    # ollama pull all-minilm (this might pull all-minilm-l6-v2)
+    # Ensure config.yaml exists and Ollama is running with configured default models
+    # Models needed for test:
+    # - lsw.default_chat_model (e.g., gemma3:4b-it-fp16 from config)
+    # - lsw.default_embedding_model_ollama (e.g., nomic-embed-text from config)
+    # - lsw.default_embedding_model_st (e.g., all-MiniLM-L6-v2 from config)
     
-    # You might need to adjust model names based on what you have locally.
-    # For ST, the first run will download the model if not cached.
+    # The conditional import for config_loader should handle sys.path if needed for direct run
+    # (assuming config_loader.py is in the same 'core' directory or path is set up)
+    # If config_loader itself has issues being found when running this file directly,
+    # the get_config() call in LSW.__init__ will fail.
+    # Let's add the sys.path modification here too for robustness of direct execution of this file.
+    if __package__ is None: # Running file directly
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # Now from .config_loader import get_config should work, or it's already imported globally
 
-    lsw = LLMServiceWrapper(
-        default_chat_model="gemma3:1b-it-fp16", # Make sure you have this model in Ollama
-        default_embedding_model_ollama="nomic-embed-text", # Or another Ollama embed model
-        default_embedding_model_st="all-MiniLM-L6-v2" # A common ST model
-    )
+    lsw = LLMServiceWrapper() # Now uses config internally
 
     if not lsw.client:
         print("Ollama client failed to initialize. Exiting LSW tests.")
     else:
         print("\n--- Listing Local Ollama Models ---")
         local_models = lsw.list_local_models()
+        # ... (rest of the model listing print logic, no changes needed here) ...
         if local_models:
             print(f"Found {len(local_models)} models:")
-            for model_obj in local_models[:3]: # Rename to model_obj to emphasize it's an object
+            for model_obj in local_models[:3]: 
                 try:
-                    # Accessing as attributes
-                    model_tag = model_obj.model
+                    model_tag = model_obj.model 
                     size_gb = model_obj.size / (1024**3)
                     modified_at = model_obj.modified_at
                     print(f"  - Model Tag: {model_tag}, Size: {size_gb:.2f} GB, Modified: {modified_at}")
-                except AttributeError as e:
-                    print(f"  - Error accessing attributes for a model: {e}. Raw model info: {model_obj}")
-                except Exception as e: # Catch any other unexpected errors for a model entry
-                    print(f"  - Unexpected error processing a model entry: {e}. Raw model info: {model_obj}")
-        else:
-            print("No local Ollama models found or error listing them.")
+                except AttributeError as e: print(f"  - Error accessing attributes for a model: {e}. Raw model info: {model_obj}")
+                except Exception as e: print(f"  - Unexpected error processing a model entry: {e}. Raw model info: {model_obj}")
+        else: print("No local Ollama models found or error listing them.")
+
 
         print("\n--- Testing Chat Completion (Non-Streamed) ---")
         chat_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "What is the capital of France?"}
         ]
-        # Using the default_chat_model specified in LSW init
+        # Uses lsw.default_chat_model from config
         chat_response = lsw.generate_chat_completion(messages=chat_messages, temperature=0.1) 
-        if chat_response:
-            print(f"Chatbot Response: {chat_response}")
-        else:
-            print("Chat completion failed.")
+        if chat_response: print(f"Chatbot Response: {chat_response}")
+        else: print("Chat completion failed.")
 
         print("\n--- Testing Chat Completion (Streamed) ---")
-        # Using a different model if available and desired for testing
-        # stream_model = "mistral:latest" # Example, ensure you have it
-        # print(f"Attempting streamed response from {lsw.default_chat_model}:")
+        # Uses lsw.default_chat_model from config
         streamed_response_iter = lsw.generate_chat_completion(
             messages=[{"role": "user", "content": "Tell me a very short story about a robot."}],
-            model_name=lsw.default_chat_model, # Explicitly using default
-            stream=True,
-            max_tokens=50 # Example option
+            stream=True, max_tokens=50
         )
+        # ... (rest of streaming print logic, no changes needed here) ...
         if streamed_response_iter:
             print("Streamed Story: ", end='')
             full_story = ""
-            for chunk in streamed_response_iter:
-                print(chunk, end='', flush=True)
-                full_story += chunk
-            print("\n(End of stream)")
-            # print(f"Full streamed story collected: {full_story}")
-        else:
-            print("Streamed chat completion failed.")
+            try:
+                for chunk in streamed_response_iter:
+                    print(chunk, end='', flush=True)
+                    full_story += chunk
+                print("\n(End of stream)")
+            except Exception as e:
+                print(f"\nError during stream consumption: {e}")
+        else: print("Streamed chat completion failed.")
+
 
         print("\n--- Testing Ollama Embeddings ---")
+        # Uses lsw.default_embedding_model_ollama from config
         ollama_emb = lsw.generate_embedding("Hello from Ollama embeddings!", source="ollama")
-        if ollama_emb:
-            print(f"Ollama Embedding (first 5 dims): {ollama_emb[:5]}... (Length: {len(ollama_emb)})")
-        else:
-            print("Ollama embedding generation failed.")
+        # ... (rest of Ollama embedding print logic) ...
+        if ollama_emb: print(f"Ollama Embedding (first 5 dims): {ollama_emb[:5]}... (Length: {len(ollama_emb)})")
+        else: print("Ollama embedding generation failed.")
 
-    # Test SentenceTransformer embeddings separately, as Ollama client isn't needed
-    if lsw.st_model: # Check if ST model was loaded
+    # Test SentenceTransformer embeddings separately
+    if lsw.st_model: 
         print("\n--- Testing SentenceTransformer Embeddings ---")
+        # Uses lsw.default_embedding_model_st from config
         st_emb = lsw.generate_embedding("Hello from SentenceTransformer!", source="st")
-        if st_emb:
-            print(f"SentenceTransformer Embedding (first 5 dims): {st_emb[:5]}... (Length: {len(st_emb)})")
-        else:
-            print("SentenceTransformer embedding generation failed.")
+        # ... (rest of ST embedding print logic) ...
+        if st_emb: print(f"SentenceTransformer Embedding (first 5 dims): {st_emb[:5]}... (Length: {len(st_emb)})")
+        else: print("SentenceTransformer embedding generation failed.")
     else:
         print("\nSkipping SentenceTransformer Embeddings test as model did not load.")
 

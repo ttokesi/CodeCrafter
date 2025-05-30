@@ -6,39 +6,18 @@ import datetime # For timestamps
 import json # For storing metadata as JSON strings
 import os # For path joining
 import chromadb
-from chromadb.utils import embedding_functions
-
-
-try:
-    # Using a specific, known small model for consistency
-    # If you have issues with this model, 'all-MiniLM-L6-v2' is another popular choice.
-    DEFAULT_EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L3-v2"
-    # The embedding_functions.SentenceTransformerEmbeddingFunction handles model download
-    default_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=DEFAULT_EMBEDDING_MODEL_NAME)
-    SENTENCE_TRANSFORMER_AVAILABLE = True
-except ImportError:
-    print("Warning: sentence-transformers library not found. VectorStoreChroma may not function with default embeddings.")
-    print("Please install it: pip install sentence-transformers")
-    default_ef = None
-    SENTENCE_TRANSFORMER_AVAILABLE = False
-except Exception as e: # Catch other potential errors during model loading
-    print(f"Warning: Could not load default sentence-transformer model '{DEFAULT_EMBEDDING_MODEL_NAME}'. Error: {e}")
-    print("VectorStoreChroma may not function with default embeddings.")
-    default_ef = None
-    SENTENCE_TRANSFORMER_AVAILABLE = False
-
-# This will create 'ltm_database.db' in the main project directory.
-# You might want to place it inside an 'data' directory later.
-DATABASE_PATH = 'ltm_database.db'
-
-CHROMA_PERSIST_DIRECTORY = "ltm_vector_store_chroma"
+from chromadb import Documents, EmbeddingFunction, Embeddings 
+import time # <--- ADD THIS IMPORT
+import gc
 
 class RawConversationLog:
     """
     Manages the raw conversation log stored in an SQLite database.
     Stores every interaction turn by turn.
     """
-    def __init__(self, db_path=DATABASE_PATH):
+    def __init__(self, db_path: str): # db_path is now required, no default
+        self.db_path = db_path
+        self._create_table()
         """
         Initializes the RawConversationLog.
         Connects to the SQLite database and creates the necessary table if it doesn't exist.
@@ -222,7 +201,7 @@ class StructuredKnowledgeBase:
     """
     Manages structured knowledge (facts, preferences, entities) in SQLite.
     """
-    def __init__(self, db_path=DATABASE_PATH):
+    def __init__(self, db_path: str): # db_path is now required, no default
         self.db_path = db_path
         self._create_tables()
 
@@ -396,50 +375,54 @@ class StructuredKnowledgeBase:
 class VectorStoreChroma:
     """
     Manages a vector store using ChromaDB for semantic search.
+    Requires an externally provided embedding function.
     """
-    def __init__(self, persist_directory=CHROMA_PERSIST_DIRECTORY, collection_name="conversation_store", embedding_function=None):
+    def __init__(self, 
+                 persist_directory: str, 
+                 embedding_function, # Now a required argument
+                 collection_name: str = "conversation_store"):
         """
         Initializes the ChromaDB vector store.
 
         Args:
             persist_directory (str): Directory to store ChromaDB data.
+            embedding_function (callable): A function that takes a list of texts
+                                           and returns a list of embeddings.
+                                           ChromaDB will use this for new documents.
             collection_name (str): Name of the collection within ChromaDB.
-            embedding_function (chromadb.EmbeddingFunction, optional): 
-                The embedding function to use. Defaults to a pre-configured SentenceTransformer.
-                If None and SENTENCE_TRANSFORMER_AVAILABLE is False, an error will be raised.
         """
+        if not callable(embedding_function):
+            raise TypeError("embedding_function must be a callable (e.g., a function or method).")
+
         self.persist_directory = persist_directory
         self.collection_name = collection_name
+        self.embedding_function = embedding_function # Store it, Chroma needs it
 
-        if embedding_function is None:
-            if SENTENCE_TRANSFORMER_AVAILABLE and default_ef is not None:
-                self.embedding_function = default_ef
-                print(f"VectorStoreChroma initialized with default SentenceTransformer embedding function: {DEFAULT_EMBEDDING_MODEL_NAME}")
-            else:
-                raise ValueError("No embedding function provided and default SentenceTransformer is not available.")
-        else:
-            self.embedding_function = embedding_function
-            print("VectorStoreChroma initialized with provided embedding function.")
-
-        # Ensure the persist directory exists
         os.makedirs(self.persist_directory, exist_ok=True)
         
         try:
             self.client = chromadb.PersistentClient(path=self.persist_directory)
-            # Get or create the collection. This is idempotent.
+            # get_or_create_collection will use the provided embedding_function
+            # for new documents. For querying with text, it will also use it.
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
                 embedding_function=self.embedding_function 
-                # metadata={"hnsw:space": "cosine"} # Optional: specify distance metric if needed
+                # If your embedding_function is a custom class that Chroma needs to instantiate,
+                # you might need to pass it as embedding_function=MyEmbeddingFunction()
+                # But if it's just a function like lsw.generate_embedding, passing the function itself is fine.
+                # ChromaDB's default SentenceTransformerEmbeddingFunction is a class.
+                # If lsw.generate_embedding needs to be wrapped in a class that Chroma expects,
+                # we'll do that when creating the function to pass in.
+                # For now, assume Chroma can use the passed callable directly.
             )
-            print(f"ChromaDB collection '{self.collection_name}' loaded/created successfully from '{self.persist_directory}'.")
-            print(f"Current item count in collection: {self.collection.count()}")
+            print(f"VectorStoreChroma: ChromaDB collection '{self.collection_name}' loaded/created successfully from '{self.persist_directory}'.")
+            print(f"  Using provided embedding function: {embedding_function.__name__ if hasattr(embedding_function, '__name__') else type(embedding_function)}")
+            print(f"  Current item count in collection: {self.collection.count()}")
         except Exception as e:
-            print(f"Error initializing ChromaDB client or collection: {e}")
-            # In a real app, might want to raise this or handle more gracefully
+            print(f"VectorStoreChroma: Error initializing ChromaDB client or collection: {e}")
             self.client = None
             self.collection = None
-            raise # Reraise for now to make it clear initialization failed
+            raise
 
     def add_document(self, text_chunk: str, metadata: dict, doc_id: str = None) -> str:
         """
@@ -588,18 +571,39 @@ class LTMManager:
     Manages all Long-Term Memory components: Raw Conversation Log, Structured Knowledge Base,
     and Vector Store.
     """
-    def __init__(self, db_path=DATABASE_PATH, chroma_persist_dir=CHROMA_PERSIST_DIRECTORY, embedding_function=None):
-        self.db_path = db_path
-        self.chroma_persist_dir = chroma_persist_dir # Store for reset
-        self.embedding_function_ref = embedding_function # Store for reset
+    def __init__(self, 
+                 db_path: str, # Required SQLite DB path
+                 chroma_persist_dir: str, # Required ChromaDB persistence directory
+                 embedding_function # Required embedding function for VectorStoreChroma
+                ):
+        """
+        Initializes all Long-Term Memory components.
 
-        self.raw_log = RawConversationLog(db_path)
-        self.skb = StructuredKnowledgeBase(db_path)
+        Args:
+            db_path (str): Path for LTM's SQLite database file.
+            chroma_persist_dir (str): Directory for LTM's ChromaDB persistence.
+            embedding_function (callable): Embedding function to be used by VectorStoreChroma.
+        """
+        if not db_path or not isinstance(db_path, str):
+            raise ValueError("LTMManager requires a valid db_path string.")
+        if not chroma_persist_dir or not isinstance(chroma_persist_dir, str):
+            raise ValueError("LTMManager requires a valid chroma_persist_dir string.")
+        if not callable(embedding_function):
+            raise TypeError("LTMManager requires a callable embedding_function for its VectorStore.")
+
+        self.db_path = db_path
+        # self.chroma_persist_dir = chroma_persist_dir # Not needed to store if passed directly
+        
+        print(f"LTMManager: Initializing with DB: '{db_path}', Chroma Dir: '{chroma_persist_dir}'")
+
+        self.raw_log = RawConversationLog(db_path=self.db_path)
+        self.skb = StructuredKnowledgeBase(db_path=self.db_path)
         
         self.vector_store = VectorStoreChroma(
-            persist_directory=self.chroma_persist_dir,
-            embedding_function=self.embedding_function_ref
+            persist_directory=chroma_persist_dir, # Pass it through
+            embedding_function=embedding_function   # Pass it through
         )
+        print("LTMManager: All LTM components initialized.")
 
     # Expose methods from raw_log
     def log_interaction(self, *args, **kwargs): return self.raw_log.log_interaction(*args, **kwargs)
@@ -621,13 +625,12 @@ class LTMManager:
 
     def reset_ltm(self, confirm_reset=False):
         """
-        DANGER: Resets all Long-Term Memory components.
+        DANGER: Resets all Long-Term Memory components for this LTMManager instance.
         This involves deleting all data from SQLite tables used by RawConversationLog and SKB,
-        and clearing the ChromaDB vector store.
+        and clearing the ChromaDB vector store associated with this LTMManager.
 
         Args:
             confirm_reset (bool): Must be True to proceed with the reset.
-                                  This is a safety measure.
         Returns:
             bool: True if reset was successful, False otherwise.
         """
@@ -635,128 +638,172 @@ class LTMManager:
             print("LTM reset aborted. `confirm_reset` must be True.")
             return False
 
-        print(f"WARNING: Proceeding with full LTM reset for SQLite DB: '{self.db_path}' and Chroma dir: '{self.chroma_persist_dir}'")
+        # Get chroma_persist_dir from the vector_store instance for the warning message
+        chroma_dir_for_warning = "unknown (vector_store not initialized)"
+        if hasattr(self, 'vector_store') and self.vector_store and hasattr(self.vector_store, 'persist_directory'):
+            chroma_dir_for_warning = self.vector_store.persist_directory
+            
+        print(f"WARNING: Proceeding with full LTM reset for SQLite DB: '{self.db_path}' and Chroma dir: '{chroma_dir_for_warning}'")
         
         success_sqlite = False
         success_chroma = False
 
         # 1. Reset SQLite tables (delete all rows)
         try:
-            with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-                cursor = conn.cursor()
-                print("Deleting data from 'conversation_log' table...")
-                cursor.execute("DELETE FROM conversation_log")
-                print("Deleting data from 'facts' table...")
-                cursor.execute("DELETE FROM facts")
-                print("Deleting data from 'user_preferences' table...")
-                cursor.execute("DELETE FROM user_preferences")
-                # Add DELETE FROM entities if you implement it fully
-                # cursor.execute("DELETE FROM entities") 
-                conn.commit()
-                print("SQLite tables cleared.")
+            # Ensure raw_log and skb are initialized
+            if hasattr(self, 'raw_log') and self.raw_log and hasattr(self, 'skb') and self.skb:
+                with sqlite3.connect(self.db_path, check_same_thread=False) as conn: # Assuming check_same_thread for simplicity
+                    cursor = conn.cursor()
+                    # Check if tables exist before trying to delete from them (more robust)
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversation_log'")
+                    if cursor.fetchone():
+                        print("  LTM Reset: Deleting data from 'conversation_log' table...")
+                        cursor.execute("DELETE FROM conversation_log")
+                    
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='facts'")
+                    if cursor.fetchone():
+                        print("  LTM Reset: Deleting data from 'facts' table...")
+                        cursor.execute("DELETE FROM facts")
+
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'")
+                    if cursor.fetchone():
+                        print("  LTM Reset: Deleting data from 'user_preferences' table...")
+                        cursor.execute("DELETE FROM user_preferences")
+                    
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entities'")
+                    if cursor.fetchone(): # If entities table exists
+                        print("  LTM Reset: Deleting data from 'entities' table...")
+                        cursor.execute("DELETE FROM entities")
+                    conn.commit()
+                print("  LTM Reset: SQLite tables cleared.")
                 success_sqlite = True
+            else:
+                print("  LTM Reset: Raw log or SKB not initialized, skipping SQLite table clear.")
         except sqlite3.Error as e:
-            print(f"SQLite error during LTM reset: {e}")
+            print(f"  LTM Reset: SQLite error during LTM reset: {e}")
         
         # 2. Reset ChromaDB vector store
-        # We can use the existing clear_all_documents method in VectorStoreChroma
-        # which deletes and recreates the collection.
-        print("Clearing ChromaDB vector store...")
-        if self.vector_store:
-            success_chroma = self.vector_store.clear_all_documents()
+        print("  LTM Reset: Clearing ChromaDB vector store...")
+        if hasattr(self, 'vector_store') and self.vector_store:
+            success_chroma = self.vector_store.clear_all_documents() # This method deletes and recreates collection
         else:
-            print("Vector store not initialized, skipping Chroma clear.")
-            # If vector_store might not be initialized, this check is good.
-            # For our current LTMManager, it should always be initialized.
+            print("  LTM Reset: Vector store not initialized, skipping Chroma clear.")
+            success_chroma = True # Consider it a success if no VS to clear
 
         if success_sqlite and success_chroma:
-            print("LTM reset completed successfully.")
+            print("LTM reset completed successfully for this LTMManager instance.")
             return True
         else:
-            print("LTM reset failed or was partial.")
+            print("LTM reset failed or was partial for this LTMManager instance.")
             return False
 
 
+# In offline_chat_bot/mmu/ltm.py
+
 if __name__ == "__main__":
-    print("Testing LTMManager (including VectorStoreChroma and reset)...")
+    print("--- Testing LTMManager (RawConversationLog, SKB, VectorStoreChroma with mock embedding) ---")
     
-    test_sqlite_db = 'test_ltm_manager_full.db'
-    test_chroma_dir = 'test_ltm_chroma_store' 
+    # Define paths for test databases/stores for this ltm.py direct test
+    test_ltm_sqlite_db = 'test_ltm_direct_sqlite.db'
+    test_ltm_chroma_dir = 'test_ltm_direct_chroma_store'
 
-    import shutil
-    if os.path.exists(test_chroma_dir):
-        print(f"Removing previous test Chroma store: {test_chroma_dir}")
-        shutil.rmtree(test_chroma_dir)
-    if os.path.exists(test_sqlite_db):
-        print(f"Removing previous test SQLite DB: {test_sqlite_db}")
-        os.remove(test_sqlite_db)
+    # Cleanup previous test files for this specific test run
+    import shutil # Ensure shutil is imported if not already global in this file
+    if os.path.exists(test_ltm_chroma_dir):
+        print(f"Removing previous test Chroma store: {test_ltm_chroma_dir}")
+        shutil.rmtree(test_ltm_chroma_dir)
+    if os.path.exists(test_ltm_sqlite_db):
+        print(f"Removing previous test SQLite DB: {test_ltm_sqlite_db}")
+        os.remove(test_ltm_sqlite_db)
 
-    if not SENTENCE_TRANSFORMER_AVAILABLE:
-        print("Skipping VectorStoreChroma tests as sentence-transformers is not available.")
-        ltm_for_reset_test = None # Cannot test reset fully
-    else:
-        print(f"Initializing LTMManager with SQLite: '{test_sqlite_db}' and Chroma: '{test_chroma_dir}'")
-        try:
-            ltm = LTMManager(db_path=test_sqlite_db, chroma_persist_dir=test_chroma_dir)
-            ltm_for_reset_test = ltm # Use this instance for reset test too
-        except Exception as e:
-            print(f"Failed to initialize LTMManager for testing: {e}")
-            print("Skipping LTMManager tests.")
-            ltm_for_reset_test = None
-            exit() # Exit if LTM can't be initialized for tests
+    # --- Mock Embedding Function for testing LTMManager directly ---
+    # This simulates what an LSW embedding function would provide.
+    # It needs to return a list of embeddings (list of lists of floats).
+    # For simplicity, our mock will return fixed-size lists of zeros.
+    # The actual embedding values don't matter for testing VectorStoreChroma's mechanics.
+	
+    MOCK_EMBEDDING_DIM = 10 
 
-        # ... (existing vector store tests - keep them here) ...
-        print("\n--- Testing Vector Store (via LTMManager) ---")
-        doc1_id = ltm.add_document_to_vector_store(
-            text_chunk="The weather today is sunny and warm.",
-            metadata={"source": "weather_update", "day": "monday", "conversation_id": "conv_vec_001"}
-        )
-        print(f"Added doc1: {doc1_id}")
-        doc2_id = ltm.add_document_to_vector_store(
-            text_chunk="Project Phoenix is due by end of next month.",
-            metadata={"source": "project_meeting", "project": "Phoenix", "conversation_id": "conv_vec_001"}
-        )
-        print(f"Added doc2: {doc2_id}")
-        # ... more vector tests ...
-        import time
-        time.sleep(1)
-        print("\nSearching for 'current weather':")
-        results1 = ltm.semantic_search_vector_store(query_text="current weather", top_k=2)
-        for res in results1: print(f"  ID: {res['id']}, Dist: {res['distance']:.4f}, Text: '{res['text_chunk']}', Meta: {res['metadata']}")
+    class MockLtmTestEmbeddingFunction(EmbeddingFunction):
+        def __init__(self, dim: int = 10):
+            self.dim = dim
+            print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
 
-
-        # --- Test LTM Reset ---
-        if ltm_for_reset_test: # Check if ltm was initialized successfully
-            print("\n--- Testing LTM Reset ---")
-            # Add some data to SKB and RawLog first
-            ltm_for_reset_test.log_interaction("conv_reset_test", 1, "user", "Test log before reset")
-            ltm_for_reset_test.store_fact("TestSubject", "TestPredicate", "TestObject")
+        # This is the method ChromaDB will call.
+        # It MUST be named __call__ and take 'self' and 'input'.
+        def __call__(self, input: Documents) -> Embeddings:
+            # 'input' will be a list of strings (Documents is type alias for Sequence[Document])
+            # 'Embeddings' is a type alias for Sequence[Embedding] (list of lists of floats)
+            if not input: # Handle empty input list
+                return []
+                
+            print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} document(s). Example: '{str(input[0])[:30] if input else 'N/A'}'")
             
-            print(f"Items in vector store before reset: {ltm_for_reset_test.vector_store.collection.count()}")
-            history_before_reset = ltm_for_reset_test.get_conversation_history("conv_reset_test")
-            print(f"Log entries for 'conv_reset_test' before reset: {len(history_before_reset)}")
-            facts_before_reset = ltm_for_reset_test.get_facts(subject="TestSubject")
-            print(f"Facts for 'TestSubject' before reset: {len(facts_before_reset)}")
+            embeddings_list: Embeddings = []
+            for _ in range(len(input)):
+                embeddings_list.append([0.0] * self.dim)
+            return embeddings_list
 
-            # Attempt reset without confirmation
-            print("\nAttempting reset without confirmation:")
-            ltm_for_reset_test.reset_ltm(confirm_reset=False) # Should abort
+    # --- End Mock Embedding Function CLASS ---
 
-            # Attempt reset WITH confirmation
-            print("\nAttempting reset WITH confirmation:")
-            reset_status = ltm_for_reset_test.reset_ltm(confirm_reset=True)
-            print(f"Reset status: {reset_status}")
+    ltm = None
+    try:
+        # Instantiate the mock embedding function class
+        mock_embedder_instance = MockLtmTestEmbeddingFunction(dim=10)
 
-            if reset_status:
-                print(f"Items in vector store after reset: {ltm_for_reset_test.vector_store.collection.count()}")
-                history_after_reset = ltm_for_reset_test.get_conversation_history("conv_reset_test")
-                print(f"Log entries for 'conv_reset_test' after reset: {len(history_after_reset)}")
-                facts_after_reset = ltm_for_reset_test.get_facts(subject="TestSubject")
-                print(f"Facts for 'TestSubject' after reset: {len(facts_after_reset)}")
-            else:
-                print("Reset failed, cannot verify post-reset state accurately.")
-        else:
-            print("\nSkipping LTM Reset test as LTMManager was not initialized.")
+        ltm = LTMManager(
+            db_path=test_ltm_sqlite_db, 
+            chroma_persist_dir=test_ltm_chroma_dir,
+            embedding_function=mock_embedder_instance # Pass the INSTANCE of the class
+        )
+    except Exception as e:
+        print(f"Failed to initialize LTMManager for testing: {e}")
+        print("Aborting LTMManager direct tests.")
+        exit()
+
+    # --- Test RawConversationLog via LTMManager (as before) ---
+    print("\n--- Testing Raw Log (via LTMManager) ---")
+    conv1_id_ltm_test = "conv_ltm_test_001"
+    ltm.log_interaction(conv1_id_ltm_test, 1, "user", "Hello LTM test bot!")
+    entry2_id_ltm_test = ltm.log_interaction(conv1_id_ltm_test, 2, "assistant", "Hello! LTM is working.",
+                                             metadata={"module": "ltm_test"})
+    # ... (other raw log tests if you have them)
+
+    # --- Test StructuredKnowledgeBase via LTMManager (as before) ---
+    print("\n--- Testing SKB (via LTMManager) ---")
+    ltm.store_fact("LTM Test Subject", "is_testing", "SKB component", source_turn_ids=[entry2_id_ltm_test])
+    skb_facts_ltm_test = ltm.get_facts(subject="LTM Test Subject")
+    print(f"SKB facts found: {len(skb_facts_ltm_test)}")
+    # ... (other SKB tests)
+
+    # --- Test VectorStoreChroma via LTMManager (now uses mock embedder) ---
+    print("\n--- Testing Vector Store (via LTMManager with mock embedder) ---")
+    doc1_id_vs_ltm_test = ltm.add_document_to_vector_store(
+        text_chunk="This is a test document for the LTM vector store using a mock embedder.",
+        metadata={"source": "ltm_direct_test", "id": "vs_doc1"}
+    )
+    print(f"Added doc1 to VS: {doc1_id_vs_ltm_test}")
+    if doc1_id_vs_ltm_test: # Only search if add was successful
+        time.sleep(0.5) # Give Chroma a moment
+        vs_results_ltm_test = ltm.semantic_search_vector_store(query_text="test document mock", top_k=1)
+        print("Vector Store Search Results (mock embeddings):")
+        for res in vs_results_ltm_test:
+            print(f"  - ID: {res['id']}, Text: '{res['text_chunk'][:50]}...', Meta: {res['metadata']}")
+    # ... (other vector store tests) ...
+
+    # Test LTM Reset
+    print("\n--- Testing LTM Reset (via LTMManager) ---")
+    ltm.reset_ltm(confirm_reset=True) # This will clear SQLite and recreate Chroma collection
+    print(f"LTM Reset complete. SKB facts after reset: {len(ltm.get_facts(subject='LTM Test Subject'))}")
+    print(f"LTM Vector store count after reset: {ltm.vector_store.collection.count()}")
 
 
-    print("\nLTMManager full test finished.")
+    print("\nLTMManager direct test finished.")
+    # Cleanup for ltm.py's own test
+    print("\nAttempting cleanup of ltm.py direct test files...")
+    del ltm
+    gc.collect() # Ensure gc is imported if used: import gc
+    time.sleep(0.1)
+    if os.path.exists(test_ltm_sqlite_db): os.remove(test_ltm_sqlite_db)
+    if os.path.exists(test_ltm_chroma_dir): shutil.rmtree(test_ltm_chroma_dir, ignore_errors=True) # ignore_errors for robustness
+    print("ltm.py direct test file cleanup attempt finished.")

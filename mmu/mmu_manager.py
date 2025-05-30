@@ -1,25 +1,33 @@
 # offline_chat_bot/mmu/mmu_manager.py
 
 import datetime
-from collections import deque # Efficient for adding/removing from both ends
-import json # For TinyDB if we use it for complex objects
+from collections import deque
+import json
 import time 
 import os
-import shutil
+import shutil 
+import gc 
 
-# --- For direct execution/testing of this file ---
-if __name__ == '__main__' and __package__ is None: # Only run if executed directly AND not as part of a package
+
+# Conditional import for LTMManager
+if __name__ == '__main__' and __package__ is None:
     import sys
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, project_root)
-    try:
-        from .ltm import LTMManager # Try relative first (for package use)
-    except ImportError:
-        from mmu.ltm import LTMManager # Fallback for direct run after path mod
-else: # If imported as part of a package
-    from .ltm import LTMManager # Standard relative import
-# --- End of testing specific import logic ---
+    project_root_for_direct_run = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root_for_direct_run not in sys.path:
+        sys.path.insert(0, project_root_for_direct_run)
+    from mmu.ltm import LTMManager
+    # For the __main__ test block in this file, we'll also need LSW and its embedding function (or a mock)
+    from core.llm_service_wrapper import LLMServiceWrapper # For testing MMU init
+    from core.config_loader import get_config, get_project_root
+    from chromadb import Documents, EmbeddingFunction, Embeddings # For mock embedding class in __main__
 
+else: 
+    from .ltm import LTMManager 
+    from core.config_loader import get_config, get_project_root
+    # When MMU is imported as a module, it will expect an embedding_function to be passed to its __init__
+    # It won't initialize LSW itself.
+
+# TinyDB imports (as before)
 try:
     from tinydb import TinyDB, Query, where
     from tinydb.storages import JSONStorage
@@ -27,34 +35,20 @@ try:
     TINYDB_AVAILABLE = True
 except ImportError:
     TINYDB_AVAILABLE = False
-    print("Warning: tinydb library not found. MTM will be in-memory only.")
+    # ... (dummy TinyDB classes as before) ...
     class TinyDB: pass 
     class Query: pass
     def where(key): return None 
-
-DEFAULT_STM_MAX_TURNS = 10 # Default number of recent turns to keep in STM
-MTM_DATABASE_PATH = 'mtm_store.json' # Default path if TinyDB is used
-
-LTM_SQLITE_DB_PATH = 'ltm_main_database.db'
-LTM_CHROMA_PERSIST_DIRECTORY = "ltm_main_vector_store"
 
 class ShortTermMemory:
     """
     Manages Short-Term Memory (STM) for the immediate conversation context.
     Uses a deque to store recent conversation turns.
     """
-    def __init__(self, max_turns: int = DEFAULT_STM_MAX_TURNS):
-        """
-        Initializes the ShortTermMemory.
-
-        Args:
-            max_turns (int): The maximum number of recent turns to keep in STM.
-        """
+    def __init__(self, max_turns: int): # max_turns is now required
         self.max_turns = max_turns
-        # A deque is a double-ended queue, efficient for appending and popping from either end.
-        # We'll store dictionaries representing turns: {"role": "user/assistant", "content": "...", "timestamp": "..."}
         self.history = deque(maxlen=max_turns)
-        self.scratchpad_content = "" # For ReAct style agent thoughts
+        self.scratchpad_content = "" 
 
     def add_turn(self, role: str, content: str):
         """
@@ -126,17 +120,9 @@ class MediumTermMemory:
     Manages Medium-Term Memory (MTM) for session-specific summaries, entities, etc.
     Can operate in-memory or with TinyDB for simple file-based persistence.
     """
-    def __init__(self, use_tinydb: bool = False, db_path: str = MTM_DATABASE_PATH):
-        """
-        Initializes the MediumTermMemory.
-
-        Args:
-            use_tinydb (bool): If True and TinyDB is available, use TinyDB for persistence.
-                               Otherwise, MTM is in-memory only.
-            db_path (str): Path to the TinyDB JSON file if use_tinydb is True.
-        """
+    def __init__(self, use_tinydb: bool, db_path: str): # Parameters are now required
         self.is_persistent = False
-        self.db = None # For TinyDB instance
+        self.db = None 
         self.summaries_table = None
         self.entities_table = None
         self.context_table = None
@@ -144,7 +130,7 @@ class MediumTermMemory:
         if use_tinydb and TINYDB_AVAILABLE:
             try:
                 # Using CachingMiddleware can improve performance for frequent reads
-                self.db = TinyDB(db_path, storage=CachingMiddleware(JSONStorage))
+                self.db = TinyDB(db_path, storage=CachingMiddleware(JSONStorage)) # Use passed db_path
                 self.summaries_table = self.db.table('summaries')
                 self.entities_table = self.db.table('entities')
                 self.context_table = self.db.table('task_context')
@@ -269,41 +255,65 @@ class MemoryManagementUnit:
     Central controller for all memory tiers: STM, MTM, and LTM.
     Provides a unified API for memory operations.
     """
-    def __init__(self,
-                 stm_max_turns: int = DEFAULT_STM_MAX_TURNS,
-                 mtm_use_tinydb: bool = False,
-                 mtm_db_path: str = MTM_DATABASE_PATH,
-                 ltm_sqlite_db_path: str = LTM_SQLITE_DB_PATH,
-                 ltm_chroma_persist_dir: str = LTM_CHROMA_PERSIST_DIRECTORY,
-                 #ltm_embedding_function = None # Allow passing custom embedding func to LTM
+    def __init__(self, 
+                 embedding_function, # Required: for LTM VectorStore
+                 config: dict = None  # Optional: for passing a specific config (e.g., for tests)
                 ):
         """
-        Initializes all memory components.
+        Initializes all memory components using global config or a provided config dict.
 
         Args:
-            stm_max_turns (int): Max turns for Short-Term Memory.
-            mtm_use_tinydb (bool): Whether Medium-Term Memory should use TinyDB for persistence.
-            mtm_db_path (str): Path for MTM's TinyDB file (if used).
-            ltm_sqlite_db_path (str): Path for LTM's SQLite database file.
-            ltm_chroma_persist_dir (str): Directory for LTM's ChromaDB persistence.
-            ltm_embedding_function: Embedding function to pass to LTM's VectorStore.
-                                   If None, LTMManager will use its default.
+            embedding_function (callable): The function to be used for generating embeddings
+                                           for the LTM Vector Store.
+            config (dict, optional): A configuration dictionary. If None, loads global config.
         """
-        print("Initializing MemoryManagementUnit...")
+        if not callable(embedding_function):
+            raise TypeError("MemoryManagementUnit requires a callable embedding_function for LTM.")
+
+        if config is None:
+            print("MMU: Loading global configuration...")
+            config = get_config()
+        else:
+            print("MMU: Using provided configuration dictionary.")
+            
+        mmu_config = config.get('mmu', {})
+        project_r = get_project_root()
+
+        # STM Config
+        stm_max_turns = mmu_config.get('stm_max_turns', 10) # Default if not in config
+        
+        # MTM Config
+        mtm_use_tinydb = mmu_config.get('mtm_use_tinydb', False)
+        mtm_db_path_relative = mmu_config.get('mtm_db_path', 'data/mtm_store.json') # Default path
+        mtm_db_path_abs = os.path.join(project_r, mtm_db_path_relative)
+        # Ensure directory for MTM db exists if it's persistent
+        if mtm_use_tinydb:
+            os.makedirs(os.path.dirname(mtm_db_path_abs), exist_ok=True)
+
+        # LTM Config (paths for LTMManager)
+        ltm_sqlite_db_path_relative = mmu_config.get('ltm_sqlite_db_path', 'data/ltm_database.db')
+        ltm_sqlite_db_path_abs = os.path.join(project_r, ltm_sqlite_db_path_relative)
+        
+        ltm_chroma_persist_dir_relative = mmu_config.get('ltm_chroma_persist_directory', 'data/ltm_vector_store')
+        ltm_chroma_persist_dir_abs = os.path.join(project_r, ltm_chroma_persist_dir_relative)
+        # Ensure directories for LTM dbs exist
+        os.makedirs(os.path.dirname(ltm_sqlite_db_path_abs), exist_ok=True)
+        os.makedirs(ltm_chroma_persist_dir_abs, exist_ok=True)
+
+
+        print("Initializing MemoryManagementUnit components...")
         self.stm = ShortTermMemory(max_turns=stm_max_turns)
         print(f"  STM initialized (max_turns={stm_max_turns}).")
 
-        self.mtm = MediumTermMemory(use_tinydb=mtm_use_tinydb, db_path=mtm_db_path)
-        print(f"  MTM initialized (persistent={self.mtm.is_persistent}, path='{mtm_db_path if mtm_use_tinydb else 'in-memory'}').")
+        self.mtm = MediumTermMemory(use_tinydb=mtm_use_tinydb, db_path=mtm_db_path_abs)
+        print(f"  MTM initialized (persistent={self.mtm.is_persistent}, path='{mtm_db_path_abs if mtm_use_tinydb else 'in-memory'}').")
         
-        # LTMManager's __init__ already has defaults for its paths if not provided,
-        # but we pass them explicitly here from MMU's config.
         self.ltm = LTMManager(
-            db_path=ltm_sqlite_db_path,
-            chroma_persist_dir=ltm_chroma_persist_dir,
-            #embedding_function=ltm_embedding_function
+            db_path=ltm_sqlite_db_path_abs,
+            chroma_persist_dir=ltm_chroma_persist_dir_abs,
+            embedding_function=embedding_function # Pass the provided embedding function
         )
-        print(f"  LTM initialized (SQLite='{ltm_sqlite_db_path}', Chroma_dir='{ltm_chroma_persist_dir}').")
+        print(f"  LTM initialized (SQLite='{ltm_sqlite_db_path_abs}', Chroma_dir='{ltm_chroma_persist_dir_abs}').")
         print("MemoryManagementUnit initialization complete.")
 
     # --- STM Facade Methods ---
@@ -412,157 +422,131 @@ class MemoryManagementUnit:
             print("Full MMU reset completed, but LTM reset reported issues.")
             return False
 
-# --- Updated __main__ to test MemoryManagementUnit ---
+# In offline_chat_bot/mmu/mmu_manager.py
 if __name__ == "__main__":
-    print("--- Testing MemoryManagementUnit ---")
+    print("--- Testing MemoryManagementUnit (with Config and Mock Embedding) ---")
 
-    # Define paths for test databases for MMU context
-    test_mmu_mtm_db_path = 'test_mmu_mtm_store.json'
-    test_mmu_ltm_sqlite_db_path = 'test_mmu_ltm_sqlite.db'
-    test_mmu_ltm_chroma_dir = 'test_mmu_ltm_chroma'
+    # Load the main application config for this test
+    # This ensures MMU initializes with paths that should exist based on config.
+    # The get_config() in config_loader already creates the base 'data_dir'
+    app_config = get_config() # Loads from config.yaml
+    from chromadb import Documents, EmbeddingFunction, Embeddings
+    # --- Mock LSW and Embedding Function for MMU Test ---
+    # We need this because MMU now requires an embedding_function for LTMManager
+    class MockMMUTestEmbeddingFunction(EmbeddingFunction): # Inherit from Chroma's base
+        def __init__(self, dim: int = 10):
+            self.dim = dim
+            print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
+        def __call__(self, input: Documents) -> Embeddings:
+            if not input: return []
+            print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} doc(s).")
+            return [[0.0] * self.dim for _ in range(len(input))]
+    
+    mock_embed_func_for_mmu = MockMMUTestEmbeddingFunction(dim=100) # Instance
+    # --- End Mock ---
 
-    # --- Cleanup previous test files for MMU ---
-    if os.path.exists(test_mmu_mtm_db_path): os.remove(test_mmu_mtm_db_path)
-    if os.path.exists(test_mmu_ltm_sqlite_db_path): os.remove(test_mmu_ltm_sqlite_db_path)
-    import shutil # For rmtree
-    if os.path.exists(test_mmu_ltm_chroma_dir): shutil.rmtree(test_mmu_ltm_chroma_dir)
+    # Define unique test paths to avoid conflict with production data or other tests
+    test_mmu_main_mtm_db_path = os.path.join(get_project_root(), 'test_data/mmu_test_mtm_store.json')
+    test_mmu_main_ltm_sqlite_db_path = os.path.join(get_project_root(), 'test_data/mmu_test_ltm_sqlite.db')
+    test_mmu_main_ltm_chroma_dir = os.path.join(get_project_root(), 'test_data/mmu_test_ltm_chroma')
+
+    # Create a specific test configuration dictionary to override default paths
+    test_specific_mmu_config_override = {
+        "mmu": {
+            "stm_max_turns": 5, # Test with a different value
+            "mtm_use_tinydb": True, # Test MTM persistence
+            "mtm_db_path": os.path.relpath(test_mmu_main_mtm_db_path, get_project_root()),
+            "ltm_sqlite_db_path": os.path.relpath(test_mmu_main_ltm_sqlite_db_path, get_project_root()),
+            "ltm_chroma_persist_directory": os.path.relpath(test_mmu_main_ltm_chroma_dir, get_project_root())
+        },
+        "data_dir": "test_data" # Ensure test_data is used as base by get_project_root() + path in MMU init
+                                # Or make all paths absolute above and don't rely on data_dir here for testing.
+                                # Let's make paths absolute for clarity in test setup.
+    }
+    # Re-assign absolute paths for clarity, MMU will resolve from project_root if paths in config are relative
+    test_specific_mmu_config_override["mmu"]["mtm_db_path"] = test_mmu_main_mtm_db_path
+    test_specific_mmu_config_override["mmu"]["ltm_sqlite_db_path"] = test_mmu_main_ltm_sqlite_db_path
+    test_specific_mmu_config_override["mmu"]["ltm_chroma_persist_directory"] = test_mmu_main_ltm_chroma_dir
+    
+    # Ensure test_data directory and its subdirectories for Chroma exist for this specific test
+    os.makedirs(os.path.dirname(test_mmu_main_mtm_db_path), exist_ok=True)
+    os.makedirs(os.path.dirname(test_mmu_main_ltm_sqlite_db_path), exist_ok=True)
+    os.makedirs(test_mmu_main_ltm_chroma_dir, exist_ok=True)
+
+
+    # --- Cleanup previous test files for MMU's own test ---
+    if os.path.exists(test_mmu_main_mtm_db_path): os.remove(test_mmu_main_mtm_db_path)
+    if os.path.exists(test_mmu_main_ltm_sqlite_db_path): os.remove(test_mmu_main_ltm_sqlite_db_path)
+    if os.path.exists(test_mmu_main_ltm_chroma_dir): shutil.rmtree(test_mmu_main_ltm_chroma_dir)
+    # Recreate Chroma dir after rmtree
+    os.makedirs(test_mmu_main_ltm_chroma_dir, exist_ok=True)
     # --- End MMU test file cleanup ---
 
-    # Initialize MMU
-    # For testing, we'll enable TinyDB for MTM to see its path logging.
-    # LTM will use its default embedding function (sentence-transformer).
-    mmu_instance = MemoryManagementUnit(
-        mtm_use_tinydb=TINYDB_AVAILABLE, # Only use TinyDB if available for test
-        mtm_db_path=test_mmu_mtm_db_path,
-        ltm_sqlite_db_path=test_mmu_ltm_sqlite_db_path,
-        ltm_chroma_persist_dir=test_mmu_ltm_chroma_dir
-    )
+    mmu_instance = None
+    try:
+        print(f"\nInitializing MemoryManagementUnit with specific test config and mock embedder...")
+        mmu_instance = MemoryManagementUnit(
+            embedding_function=mock_embed_func_for_mmu,
+            config=test_specific_mmu_config_override # Pass our test-specific config
+        )
+    except Exception as e:
+        print(f"FATAL: Could not initialize MMU for testing: {e}")
+        raise # Reraise to see traceback during testing
 
-    print("\n--- Testing STM via MMU ---")
-    mmu_instance.add_stm_turn("user", "MMU Test: User message 1")
-    mmu_instance.add_stm_turn("assistant", "MMU Test: Assistant response 1")
+    print("\n--- Testing STM via MMU (with config values) ---")
+    mmu_instance.add_stm_turn("user", "MMU Test (Config): User message 1")
+    mmu_instance.add_stm_turn("assistant", "MMU Test (Config): Assistant response 1")
     print(f"STM History via MMU: {mmu_instance.get_stm_history()}")
-    mmu_instance.update_stm_scratchpad("MMU STM scratchpad test.")
-    print(f"STM Scratchpad via MMU: {mmu_instance.get_stm_scratchpad()}")
+    assert len(mmu_instance.get_stm_history()) <= test_specific_mmu_config_override["mmu"]["stm_max_turns"]
+    print(f"STM max_turns from config ({test_specific_mmu_config_override['mmu']['stm_max_turns']}) respected.")
 
-    print("\n--- Testing MTM via MMU ---")
-    mmu_instance.store_mtm_summary("mmu_sum_01", "MMU test summary.", {"source": "mmu_test"})
-    print(f"MTM Summary via MMU: {mmu_instance.get_mtm_summary('mmu_sum_01')}")
-    mmu_instance.store_mtm_entity("mmu_cat", "mmu_key", "mmu_value")
-    print(f"MTM Entity via MMU: {mmu_instance.get_mtm_entity('mmu_cat', 'mmu_key')}")
 
-    print("\n--- Testing LTM via MMU ---")
-    conv_id_mmu = "mmu_conv_001"
-    mmu_instance.log_ltm_interaction(conv_id_mmu, 1, "user", "LTM log via MMU.")
-    print(f"LTM History for {conv_id_mmu} via MMU: {len(mmu_instance.get_ltm_conversation_history(conv_id_mmu))} turns")
+    print("\n--- Testing MTM via MMU (with config values) ---")
+    mmu_instance.store_mtm_summary("mmu_conf_sum_01", "MMU config test summary.", {"source": "mmu_config_test"})
+    retrieved_mtm_sum = mmu_instance.get_mtm_summary('mmu_conf_sum_01')
+    print(f"MTM Summary via MMU: {retrieved_mtm_sum}")
+    assert retrieved_mtm_sum is not None and retrieved_mtm_sum['text'] == "MMU config test summary."
+    print(f"MTM using TinyDB: {mmu_instance.mtm.is_persistent}, Path: {test_mmu_main_mtm_db_path}")
+    assert mmu_instance.mtm.is_persistent == test_specific_mmu_config_override["mmu"]["mtm_use_tinydb"]
+
+    print("\n--- Testing LTM via MMU (with config values & mock embedder) ---")
+    conf_conv_id_mmu = "mmu_config_conv_001"
+    mmu_instance.log_ltm_interaction(conf_conv_id_mmu, 1, "user", "LTM log via MMU (config).")
+    print(f"LTM History for {conf_conv_id_mmu} via MMU: {len(mmu_instance.get_ltm_conversation_history(conf_conv_id_mmu))} turns")
     
-    # Check if the vector_store component of LTM is usable
-    # LTMManager's vector_store is an instance of VectorStoreChroma
-    # VectorStoreChroma's __init__ would raise an error or set self.collection to None if embedding_function failed.
-    # A more direct check is if the embedding function on the collection is set.
-    can_test_vector_store = False
-    if hasattr(mmu_instance.ltm, 'vector_store') and mmu_instance.ltm.vector_store and \
-    hasattr(mmu_instance.ltm.vector_store, 'collection') and mmu_instance.ltm.vector_store.collection and \
-    hasattr(mmu_instance.ltm.vector_store.collection, '_embedding_function') and \
-    mmu_instance.ltm.vector_store.collection._embedding_function is not None:
-        can_test_vector_store = True
+    # Test adding to vector store via MMU (will use mock embedder)
+    vs_doc_id = mmu_instance.add_document_to_ltm_vector_store("LTM vector search test via MMU (config).", {"tag": "mmu_config_test"})
+    print(f"Document added to VS via MMU with ID: {vs_doc_id}")
+    assert vs_doc_id is not None
+    time.sleep(0.5)
+    search_results_vs = mmu_instance.semantic_search_ltm_vector_store("MMU vector test config")
+    print(f"LTM Vector Search results via MMU: {len(search_results_vs)} found.")
+    assert len(search_results_vs) > 0 if vs_doc_id else True # If add failed, search might be empty
 
-    if can_test_vector_store:
-        print("  LTM Vector Store seems available for testing via MMU.")
-        mmu_instance.add_document_to_ltm_vector_store("LTM vector search test via MMU.", {"tag": "mmu_test"})
-        time.sleep(0.5) # Give chroma a moment
-        search_results = mmu_instance.semantic_search_ltm_vector_store("MMU vector test")
-        print(f"LTM Vector Search results via MMU: {len(search_results)} found.")
-        if search_results:
-            print(f"  Top result text: '{search_results[0]['text_chunk']}'")
-    else:
-        print("  Skipping LTM vector store tests via MMU as its embedding function seems unavailable (check ltm.py output for warnings).")
-
-
-    print("\n--- Testing Full MMU Reset ---")
-    # Add a bit more data before full reset
-    mmu_instance.add_stm_turn("user", "Another STM turn before reset.")
-    mmu_instance.store_mtm_summary("mmu_sum_02", "Another MTM summary before reset.")
-    mmu_instance.log_ltm_interaction(conv_id_mmu, 2, "assistant", "Another LTM log before reset.")
-
-    # Attempt reset without confirmation
-    print("\nAttempting full MMU reset (no confirm):")
-    mmu_instance.reset_all_memory(confirm_reset=False)
-
-    # Attempt reset WITH confirmation
-    print("\nAttempting full MMU reset (WITH confirm):")
-    reset_success = mmu_instance.reset_all_memory(confirm_reset=True)
-    print(f"Full MMU reset status: {reset_success}")
-
-    if reset_success:
-        print(f"STM History after reset: {mmu_instance.get_stm_history()}") # Should be empty
-        print(f"MTM Summary 'mmu_sum_01' after reset: {mmu_instance.get_mtm_summary('mmu_sum_01')}") # Should be None
-        print(f"LTM History for {conv_id_mmu} after reset: {len(mmu_instance.get_ltm_conversation_history(conv_id_mmu))} turns") # Should be 0
-        if can_test_vector_store: # Use the same check for post-reset verification
-            # After reset, the collection is re-created, so we re-check its count.
-            # The LTMManager.reset_ltm calls vector_store.clear_all_documents which recreates the collection.
-            if hasattr(mmu_instance.ltm.vector_store, 'collection') and mmu_instance.ltm.vector_store.collection:
-                print(f"LTM Chroma collection count after reset: {mmu_instance.ltm.vector_store.collection.count()}") # Should be 0
-            else:
-                print("LTM Chroma collection seems unavailable after reset.")
+    print("\n--- Testing Full MMU Reset (via MMU instance) ---")
+    mmu_instance.reset_all_memory(confirm_reset=True)
+    print(f"STM History after reset: {mmu_instance.get_stm_history()}")
+    assert not mmu_instance.get_stm_history() 
+    print(f"LTM Vector store count after reset: {mmu_instance.ltm.vector_store.collection.count()}")
+    assert mmu_instance.ltm.vector_store.collection.count() == 0
     
-    print("\nMemoryManagementUnit test finished.")
+    print("\nMemoryManagementUnit (with config) direct test finished.")
 
-    # --- Final Cleanup of MMU test files (handles potential TinyDB lock) ---
-    if TINYDB_AVAILABLE and os.path.exists(test_mmu_mtm_db_path):
-        if hasattr(mmu_instance.mtm, 'db') and mmu_instance.mtm.db:
-             mmu_instance.mtm.db.close() # Close MTM's TinyDB if it was used
-        del mmu_instance.mtm # Help release MTM
-    
-    # --- Final Cleanup of MMU test files ---
-    print("\nAttempting final cleanup of MMU test files...")
-
-    # Try to explicitly close LTM resources if they exist and have close methods
-    if hasattr(mmu_instance, 'ltm'):
-        if hasattr(mmu_instance.ltm, 'raw_log') and hasattr(mmu_instance.ltm.raw_log, '_get_connection'):
-            # SQLite connections are usually managed with context managers (with...as)
-            # which close automatically. Forcing a close here is tricky without holding
-            # an explicit connection object. LTMManager's current design doesn't expose one.
-            # So, for SQLite, we rely on Python's GC when the LTMManager instance is deleted.
-            pass 
-        if hasattr(mmu_instance.ltm, 'skb') and hasattr(mmu_instance.ltm.skb, '_get_connection'):
-            # Same as above for SKB's SQLite.
-            pass
-        if hasattr(mmu_instance.ltm, 'vector_store') and hasattr(mmu_instance.ltm.vector_store, 'client'):
-            # ChromaDB client doesn't have an explicit close(). Persistence is handled by client.
-            # Deleting the LTMManager instance should help release it.
-            pass
-
-    # Close MTM's TinyDB if it was used and the instance exists
-    if hasattr(mmu_instance, 'mtm') and hasattr(mmu_instance.mtm, 'db') and mmu_instance.mtm.db:
-         print("  Closing MTM TinyDB instance...")
-         mmu_instance.mtm.db.close()
-    
-    # Explicitly delete the MMU instance to help release all its components
-    print("  Deleting MMU instance to help release resources...")
-    del mmu_instance 
-    
-    # Optional: Force garbage collection and a small delay
-    import gc
+    # Final Cleanup
+    print("\nAttempting final cleanup of MMU direct test files...")
+    # ... (del mmu_instance, gc.collect, os.remove, shutil.rmtree for test_mmu_main_* paths) ...
+    del mmu_instance
     gc.collect()
-    time.sleep(0.1) # Give GC and OS a moment
+    time.sleep(0.1)
+    if os.path.exists(test_mmu_main_mtm_db_path): os.remove(test_mmu_main_mtm_db_path)
+    if os.path.exists(test_mmu_main_ltm_sqlite_db_path): os.remove(test_mmu_main_ltm_sqlite_db_path)
+    if os.path.exists(test_mmu_main_ltm_chroma_dir): shutil.rmtree(test_mmu_main_ltm_chroma_dir, ignore_errors=True)
+    # Remove the test_data directory if it's empty (optional)
+    try:
+        if os.path.exists(os.path.join(get_project_root(), "test_data")) and not os.listdir(os.path.join(get_project_root(), "test_data")):
+            os.rmdir(os.path.join(get_project_root(), "test_data"))
+            print("  Removed empty test_data directory.")
+    except OSError as e:
+        print(f"  Note: Could not remove test_data directory (it might not be empty or access issues): {e}")
 
-    files_to_remove = [test_mmu_mtm_db_path, test_mmu_ltm_sqlite_db_path]
-    dirs_to_remove = [test_mmu_ltm_chroma_dir]
-
-    for f_path in files_to_remove:
-        if os.path.exists(f_path):
-            try:
-                os.remove(f_path)
-                print(f"  Removed {f_path}")
-            except Exception as e:
-                print(f"  Could not remove {f_path}: {e} (This can sometimes happen on Windows due to file locks. Manual deletion might be needed if it persists.)")
-    
-    for d_path in dirs_to_remove:
-        if os.path.exists(d_path):
-            try:
-                shutil.rmtree(d_path)
-                print(f"  Removed directory {d_path}")
-            except Exception as e:
-                print(f"  Could not remove directory {d_path}: {e} (This can sometimes happen on Windows due to file locks. Manual deletion might be needed if it persists.)")
-    print("Final cleanup attempt finished.")
+    print("MMU direct test file cleanup attempt finished.")
