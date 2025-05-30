@@ -152,17 +152,29 @@ def run_cli():
                 continue
 
             # Process regular message through the orchestrator
-            print("Bot: Thinking...") # Give some feedback
-            assistant_response = orchestrator.handle_user_message(
+            print("Bot: ", end="", flush=True) # Print "Bot: " once, no newline, flush
+            
+            assistant_response_generator = orchestrator.handle_user_message(
                 user_message=user_input,
                 conversation_id=current_conversation_id
             )
 
-            if assistant_response:
-                print(f"Bot: {assistant_response}")
+            full_response_accumulated_for_display = ""
+            if assistant_response_generator:
+                try:
+                    for chunk in assistant_response_generator:
+                        print(chunk, end="", flush=True) # Print each chunk as it arrives
+                        full_response_accumulated_for_display += chunk
+                    print() # Add a newline after the full streamed response
+                except Exception as e:
+                    print(f"\nError processing streamed response: {e}")
+                    # Ensure newline if error occurs mid-stream
+                    if not full_response_accumulated_for_display.endswith('\n'):
+                        print() 
             else:
-                # This case should ideally be handled by CO returning a fallback message.
-                print("Bot: I'm sorry, I couldn't process that.")
+                # This case should ideally not be hit if CO always yields something or raises
+                print("I'm sorry, I couldn't process that.")
+
 
         except KeyboardInterrupt:
             print("\nExiting chatbot due to KeyboardInterrupt. Goodbye!")

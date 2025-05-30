@@ -231,8 +231,14 @@ class ConversationOrchestrator:
         messages.append({"role": "user", "content": final_user_content})
         return messages
 
-    def handle_user_message(self, user_message: str, conversation_id: str = None) -> str or None:
-        if not user_message.strip(): return "Please say something!"
+    def handle_user_message(self, user_message: str, conversation_id: str = None) -> iter: # Now returns an iterator (generator)
+        """
+        Main handler for processing a user's message.
+        Yields response chunks for streaming.
+        """
+        if not user_message.strip(): 
+            yield "Please say something!" # Yield instead of return
+            return # Must use return in a generator to stop it
         
         # --- STM Management & Determine if message is a question (DEFINE is_likely_question EARLIER) ---
         is_new_conversation_session = False
@@ -296,37 +302,85 @@ class ConversationOrchestrator:
             if filtered_facts_to_store: # This block only runs if not a question AND facts survived filtering
                 print(f"  CO: Storing {len(filtered_facts_to_store)} filtered fact(s) to LTM/SKB.")
                 for fact_to_store in filtered_facts_to_store:
-                    # print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'") # Optional
-                    self.mmu.store_ltm_fact(subject=fact_to_store['subject'], predicate=fact_to_store['predicate'], object_value=fact_to_store['object'], confidence=0.80)
-            elif extracted_facts_from_user and not is_likely_question: # Raw facts existed, not a question, but all got filtered
-                print("  CO: All raw extracted facts were filtered out. No facts stored in SKB.")
-            # If it was a question, the earlier filter message already covered it.
-        
-        elif extracted_facts_from_user is None: 
-             print("  CO: Fact extraction from user message failed or encountered an error (agent returned None).")
-        else: # Agent returned [], meaning it found no facts
-             print("  CO: No facts extracted from user message by agent (agent returned empty list).")
-        
-        # ... (KRA search, _build_prompt_with_context, LSW call - these are fine) ...
+                     print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'")
+                     self.mmu.store_ltm_fact(subject=fact_to_store['subject'],predicate=fact_to_store['predicate'],object_value=fact_to_store['object'],confidence=0.80)
+
         retrieved_knowledge = self.knowledge_retriever.search_knowledge(query_text=user_message, top_k_vector=DEFAULT_TOP_K_VECTOR_SEARCH, search_skb_facts=True)
+        # Build Prompt
         llm_messages = self._build_prompt_with_context(conversation_id=conversation_id, user_query=user_message, retrieved_knowledge=retrieved_knowledge)
-        print(f"  CO: Sending request to LLM (model: {self.default_llm_model})...")
-        assistant_response_text = self.lsw.generate_chat_completion(messages=llm_messages, model_name=self.default_llm_model, temperature=0.5)
-        if assistant_response_text is None:
-            assistant_response_text = "I'm sorry, I encountered an issue and couldn't generate a response right now."
-        print(f"  CO: LLM Raw Response: \"{assistant_response_text[:100].strip()}...\"")
-        self.mmu.add_stm_turn(role="assistant", content=assistant_response_text)
+        
+        print(f"  CO: Sending request to LLM (model: {self.default_llm_model}) for streaming response...")
+        
+        # --- MODIFIED SECTION for LSW call and yielding ---
+        assistant_response_stream = self.lsw.generate_chat_completion(
+            messages=llm_messages,
+            model_name=self.default_llm_model,
+            temperature=0.5, # Or your preferred temp
+            stream=True      # <--- IMPORTANT: Request streaming from LSW
+        )
 
+        if assistant_response_stream is None: # Should be an empty iterator from LSW on error
+            print("  CO: LSW returned None for stream (should be empty iterator). Yielding error message.")
+            error_message = "I'm sorry, I encountered an issue and couldn't generate a response right now."
+            yield error_message
+            # Log this failure to LTM (User turn logged later, then this error as assistant turn)
+            # This logging needs to happen *after* all chunks are processed or if stream fails.
+            # For simplicity now, if stream itself fails to start, we log just this error.
+            # A more robust way is to collect full response then log.
+            # We'll log after the loop for successful streams.
+            # This path is for LSW failing to even return a stream.
+            _current_ltm_hist = self.mmu.get_ltm_conversation_history(conversation_id)
+            _user_turn_seq_id = len(_current_ltm_hist) + 1
+            self.mmu.log_ltm_interaction(conversation_id, _user_turn_seq_id, "user", user_message)
+            self.mmu.log_ltm_interaction(conversation_id, _user_turn_seq_id + 1, "assistant_error", error_message, metadata={"error": "LSW stream init failed"})
+            self.mmu.add_stm_turn(role="assistant", content=error_message)
+            return # Stop generation
 
+        accumulated_response_for_ltm = ""
+        has_yielded_content = False
+        try:
+            for chunk in assistant_response_stream:
+                if chunk: # Ensure chunk is not empty
+                    # print(f"CO yielding chunk: '{chunk}'") # Debug: very verbose
+                    yield chunk
+                    accumulated_response_for_ltm += chunk
+                    has_yielded_content = True
+            
+            if not has_yielded_content and not accumulated_response_for_ltm: # Stream was empty
+                print("  CO: LLM stream was empty.")
+                fallback_message = "I couldn't come up with a response for that."
+                yield fallback_message
+                accumulated_response_for_ltm = fallback_message
+
+        except Exception as e:
+            print(f"  CO: Error consuming LLM stream: {e}")
+            error_message = "Sorry, there was an error while I was generating my response."
+            yield error_message # Yield error to user
+            accumulated_response_for_ltm = error_message # Log this error
+        
+        # Now that streaming is complete (or an error occurred and was yielded),
+        # update STM and log the full interaction to LTM.
+        print(f"  CO: Full assistant response (accumulated): \"{accumulated_response_for_ltm[:100].strip()}...\"")
+        self.mmu.add_stm_turn(role="assistant", content=accumulated_response_for_ltm)
+
+        # LTM Logging
         print(f"  CO: Preparing to log to LTM for conversation '{conversation_id}'.")
         current_ltm_history_len_before_log = len(self.mmu.get_ltm_conversation_history(conversation_id))
-        user_turn_log_seq_id = current_ltm_history_len_before_log + 1
-        assistant_turn_log_seq_id = user_turn_log_seq_id + 1 
+        # The user turn might have already been logged if an LSW stream init error occurred.
+        # This logic needs to be robust. Let's assume user turn is logged once.
+        # A simple way is to only log user turn here if it wasn't logged in an error path.
+        # For now, let's refine the sequence ID logic based on current LTM state.
+        
+        # Log User Turn First
+        user_turn_log_seq_id = current_ltm_history_len_before_log + 1 
+        # Check if this user turn was already logged (e.g. from an earlier LSW error path)
+        # This is complex. A simpler model: LTM logging only happens *here* at the end for a successful interaction.
+        # If LSW fails to give a stream, that earlier error logging handles it.
+
         print(f"    LTM logging: User turn seq ID: {user_turn_log_seq_id} for '{user_message[:30]}...'")
         user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(
             conversation_id=conversation_id, turn_sequence_id=user_turn_log_seq_id,
-            role="user", content=user_message,
-        )
+            role="user", content=user_message)
 
         # --- Vector Store Learning (uses is_likely_question defined earlier) ---
         if user_message and not is_likely_question: 
@@ -349,17 +403,19 @@ class ConversationOrchestrator:
                 print(f"  CO: User message not stored in Vector Store (tokens: {user_message_tokens} < {MIN_TOKENS_FOR_USER_STATEMENT_TO_VECTOR_STORE}).")
         # --- End Vector Store Learning for user message ---
         
-        print(f"    LTM logging: Assistant turn seq ID: {assistant_turn_log_seq_id} for '{assistant_response_text[:30]}...'")
+        # Log Assistant Turn
+        assistant_turn_log_seq_id = user_turn_log_seq_id + 1
+        print(f"    LTM logging: Assistant turn seq ID: {assistant_turn_log_seq_id} for '{accumulated_response_for_ltm[:30]}...'")
         self.mmu.log_ltm_interaction(
             conversation_id=conversation_id, turn_sequence_id=assistant_turn_log_seq_id,
-            role="assistant", content=assistant_response_text, llm_model_used=self.default_llm_model,
+            role="assistant", content=accumulated_response_for_ltm,
+            llm_model_used=self.default_llm_model,
             metadata={
                 "retrieved_vector_ids": [res['id'] for res in retrieved_knowledge.get("vector_results",[]) if 'id' in res],
                 "retrieved_fact_ids": [fact['fact_id'] for fact in retrieved_knowledge.get("skb_fact_results",[]) if 'fact_id' in fact],
-                "llm_call_failed": assistant_response_text is None 
+                "llm_streamed": True # Add metadata that it was streamed
             }
         )
-        return assistant_response_text
 
 if __name__ == "__main__":
     print("--- Testing CO with Context Summarization ---")

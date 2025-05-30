@@ -127,31 +127,43 @@ class LLMServiceWrapper:
                  options[key] = value
 
         try:
-            # print(f"LSW: Sending chat request to Ollama model '{model_to_use}' with messages: {messages} and options: {options}")
-            response_chunks = self.client.chat(
+            response_stream = self.client.chat( # Renamed to response_stream for clarity
                 model=model_to_use,
                 messages=messages,
-                stream=stream,
+                stream=stream, # This will be True for streaming calls
                 options=options
             )
 
             if stream:
-                # print("LSW: Streaming response...")
-                def content_stream():
-                    for chunk in response_chunks:
-                        content = chunk['message']['content']
-                        # print(f"  Stream chunk: {content}", end='', flush=True) # For live printing
-                        yield content
-                return content_stream()
-            else:
-                # print("LSW: Received non-streamed response.")
-                # The response_chunks is actually the full response dict when stream=False
-                full_response_content = response_chunks['message']['content']
-                # print(f"LSW: Full response content: {full_response_content}")
+                # print("LSW: Streaming response...") # Optional debug
+                def content_generator():
+                    full_response_for_debug = "" # For debugging if needed
+                    for chunk in response_stream:
+                        # The structure of a chunk from ollama.Client.chat (stream=True) is like:
+                        # {'model': 'gemma3:1b-it-fp16', 'created_at': '...', 'message': {'role': 'assistant', 'content': 'some text'}, 'done': False/True}
+                        # Sometimes, 'content' might be missing or empty in intermediate chunks if only metadata changes.
+                        # Or the very last chunk might have 'done': True and empty 'content'.
+                        
+                        message_part = chunk.get('message', {})
+                        content_piece = message_part.get('content', '')
+                        
+                        if content_piece: # Only yield if there's actual text content
+                            # full_response_for_debug += content_piece # Optional: accumulate for logging
+                            yield content_piece
+                        
+                        # Check if this is the final chunk and if there was no content in it
+                        if chunk.get('done') is True and not content_piece:
+                            # print(f"LSW: Stream finished. Full response for debug: {full_response_for_debug}") # Optional
+                            break # Stop generation
+                return content_generator() # Return the generator
+            else: # Non-streaming
+                # When stream=False, response_stream is actually the complete response dictionary
+                full_response_content = response_stream['message']['content']
                 return full_response_content
         except Exception as e:
             print(f"Error during Ollama chat completion with model '{model_to_use}': {e}")
-            return None
+            if stream: return iter([]) # Return an empty iterator on error for stream
+            return None # Return None on error for non-stream
 
     def generate_embedding(self,
                            text_to_embed: str,
