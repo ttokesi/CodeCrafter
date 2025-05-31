@@ -15,11 +15,15 @@ except ImportError:
 from .config_loader import get_config # <--- ADD IMPORT
 
 class LLMServiceWrapper:
-    def __init__(self): # <--- REMOVE PARAMETERS FROM SIGNATURE
+    def __init__(self, config: dict = None): # <--- ADD optional config parameter
         """
         Initializes the LLMServiceWrapper using settings from the global configuration.
         """
-        config = get_config() # Load global config
+        if config is None:
+            # print("LSW: Loading global configuration...") # Optional debug
+            config = get_config() # Load global config if specific one not provided
+        # else:
+            # print("LSW: Using provided configuration dictionary.") # Optional debug
         lsw_config = config.get('lsw', {}) # Get the 'lsw' section, or empty dict if not found
         
         self.ollama_host = lsw_config.get('ollama_host', "http://localhost:11434")
