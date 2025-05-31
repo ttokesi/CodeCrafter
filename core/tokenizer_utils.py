@@ -42,10 +42,10 @@ def get_hf_tokenizer(tokenizer_name_or_path: str = None) -> Tokenizer or None:
         return _tokenizer_cache_hf[effective_tokenizer_name]
 
     try:
-        print(f"TokenizerUtils: Attempting to load HF tokenizer '{effective_tokenizer_name}' from Hugging Face Hub...")
+        #print(f"TokenizerUtils: Attempting to load HF tokenizer '{effective_tokenizer_name}' from Hugging Face Hub...")
         tokenizer = Tokenizer.from_pretrained(effective_tokenizer_name)
         _tokenizer_cache_hf[effective_tokenizer_name] = tokenizer
-        print(f"TokenizerUtils: HF Tokenizer '{effective_tokenizer_name}' loaded and cached successfully.")
+        #print(f"TokenizerUtils: HF Tokenizer '{effective_tokenizer_name}' loaded and cached successfully.")
         return tokenizer
     except Exception as e:
         print(f"TokenizerUtils: Error loading HF tokenizer '{effective_tokenizer_name}': {e}")
@@ -70,6 +70,7 @@ def count_tokens_hf(text: str, hf_tokenizer_name: str = None) -> int or None: # 
             return None 
     return None
 
+# Inside core/tokenizer_utils.py
 def count_tokens(text: str, 
                  ollama_model_name: str, 
                  hf_tokenizer_name_override: str = None 
@@ -78,9 +79,8 @@ def count_tokens(text: str,
 
     cfg = get_config()
     tokenizer_config = cfg.get('tokenizer', {})
-    hf_tokenizer_map = tokenizer_config.get('hf_tokenizer_map', {})
-    # Use default_hf_tokenizer from config as the ultimate fallback if no mapping or override
-    overall_default_hf_tokenizer = tokenizer_config.get('default_hf_tokenizer', "google/gemma-3-4b-it") # Match your primary model's tokenizer
+    hf_tokenizer_map_from_config = tokenizer_config.get('hf_tokenizer_map', {})
+    overall_default_hf_tokenizer = tokenizer_config.get('default_hf_tokenizer', "google/gemma-3-4b-it")
 
     hf_tokenizer_to_use = overall_default_hf_tokenizer # Start with this
 
@@ -88,19 +88,27 @@ def count_tokens(text: str,
         hf_tokenizer_to_use = hf_tokenizer_name_override
         # print(f"TokenizerUtils: Using HF tokenizer override: '{hf_tokenizer_to_use}'")
     else:
-        # Try to find a direct mapping for the ollama_model_name (use lowercase for map keys)
-        mapped_tokenizer = hf_tokenizer_map.get(ollama_model_name.lower())
-        if mapped_tokenizer:
-            hf_tokenizer_to_use = mapped_tokenizer
+        # Normalize ollama_model_name for map lookup
+        normalized_ollama_model_name = ollama_model_name.lower()
+        
+        # Check for an exact match in the map first (case-insensitive key comparison)
+        exact_match_tokenizer = None
+        for map_key, hf_name in hf_tokenizer_map_from_config.items():
+            if map_key.lower() == normalized_ollama_model_name:
+                exact_match_tokenizer = hf_name
+                break
+        
+        if exact_match_tokenizer:
+            hf_tokenizer_to_use = exact_match_tokenizer
             # print(f"TokenizerUtils: Found direct map for '{ollama_model_name}' -> HF Tokenizer: '{hf_tokenizer_to_use}'")
         else: 
             # Fallback for model families if no exact match from the map
-            if "gemma" in ollama_model_name.lower():
-                hf_tokenizer_to_use = hf_tokenizer_map.get("default_gemma", overall_default_hf_tokenizer)
-            elif "llama" in ollama_model_name.lower():
-                hf_tokenizer_to_use = hf_tokenizer_map.get("default_llama", overall_default_hf_tokenizer)
-            elif "mistral" in ollama_model_name.lower():
-                hf_tokenizer_to_use = hf_tokenizer_map.get("default_mistral", overall_default_hf_tokenizer)
+            if "gemma" in normalized_ollama_model_name:
+                hf_tokenizer_to_use = hf_tokenizer_map_from_config.get("default_gemma", overall_default_hf_tokenizer)
+            elif "llama" in normalized_ollama_model_name:
+                hf_tokenizer_to_use = hf_tokenizer_map_from_config.get("default_llama", overall_default_hf_tokenizer)
+            elif "mistral" in normalized_ollama_model_name:
+                hf_tokenizer_to_use = hf_tokenizer_map_from_config.get("default_mistral", overall_default_hf_tokenizer)
             # print(f"TokenizerUtils: No direct map for '{ollama_model_name}'. Using family/default HF Tokenizer: '{hf_tokenizer_to_use}'")
     
     # print(f"TokenizerUtils: Final selected HF tokenizer: '{hf_tokenizer_to_use}' for Ollama model '{ollama_model_name}'.")

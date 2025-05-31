@@ -2,56 +2,51 @@
 
 # LLM Service Wrapper (LSW) Configuration
 lsw:
-  ollama_host: "http://localhost:11434"
-  # Ensure these models are pulled in your Ollama instance
-  default_chat_model: "gemma3:4b-it-fp16" # Your primary, capable model
-  default_embedding_model_ollama: "nomic-embed-text"
-  default_embedding_model_st: "all-MiniLM-L6-v2" # For sentence-transformers fallback/use
+  ollama_host: "http://localhost:11434" # Usually fine as is.
+  default_chat_model: "gemma3:12b-it-fp16" # IS THIS YOUR BEST/PREFERRED GENERAL MODEL?
+                                         # Ensure it's pulled in Ollama.
+  default_embedding_model_ollama: "nomic-embed-text" # Good default, ensure pulled.
+  default_embedding_model_st: "all-MiniLM-L6-v2"    # Good general ST model.
 
 # Tokenizer Utility Configuration
 tokenizer:
-  # Mapping from Ollama model tags (or families) to Hugging Face tokenizer identifiers
-  # Use lowercase for keys for easier matching
-  hf_tokenizer_map:
-    "gemma3:4b-it-fp16": "google/gemma-3-4b-it"
-    "gemma3:1b-it-fp16": "google/gemma-3-4b-it" # 3-4b tokenizer should be fine for 3-1b
-    "gemma:2b": "google/gemma-2b"
-    "default_gemma": "google/gemma-3-4b-it" # A default for any "gemma" if more specific isn't found
-    "default_llama": "meta-llama/Llama-2-7b-hf" # Example, adjust if using Llama 3
-    "default_mistral": "mistralai/Mistral-7B-v0.1"
-  default_hf_tokenizer: "google/gemma-3-4b-it" # Overall fallback if no mapping found
+  hf_tokenizer_map: # Keys should be lowercase Ollama model tags or family names
+    "gemma3:12b-it-fp16": "google/gemma-3-12b-it"  # GOOD - specific for your main model
+    "gemma3:4b-it-fp16": "google/gemma-3-4b-it"  # GOOD - specific for your main model
+    "gemma3:1b-it-fp16": "google/gemma-3-4b-it"  # GOOD - 4b tokenizer is fine for 1b Gemma3
+    "gemma:2b": "google/gemma-2b"                # For Gemma 2 if used
+    "default_gemma": "google/gemma-3-4b-it"      # GOOD - Fallback for any "gemma" model
+    "default_llama": "meta-llama/Llama-2-7b-hf"  # Placeholder - update if you use Llama 2/3
+    "default_mistral": "mistralai/Mistral-7B-v0.1" # Placeholder - update if you use Mistral
+  default_hf_tokenizer: "google/gemma-3-4b-it"     # Overall fallback if no map/family match. GOOD.
 
 # Memory Management Unit (MMU) Configuration
 mmu:
-  # Short-Term Memory
-  stm_max_turns: 10
+  stm_max_turns: 10 # Reasonable default.
   
-  # Medium-Term Memory
-  mtm_use_tinydb: true
-  mtm_db_path: "data/mtm_store.json" # Relative to project root
+  mtm_use_tinydb: true # Good for persistence.
+  mtm_db_path: "data/mtm_store.json" 
 
-  # Long-Term Memory (LTM)
-  ltm_sqlite_db_path: "data/ltm_database.db" # Relative to project root
-  ltm_chroma_persist_directory: "data/ltm_vector_store" # Relative to project root
+  ltm_sqlite_db_path: "data/ltm_database.db" 
+  ltm_chroma_persist_directory: "data/ltm_vector_store" 
   
-  ltm_vector_store_embedding_source: "st"  # "st" or "ollama" - default "st" if not present
-  # ltm_vector_store_embedding_model_name: "all-MiniLM-L6-v2" # Optional: if you want LTM VS to use a specific ST model via LSW,
-                                                            # otherwise LSW's default_embedding_model_st will be used.
-                                                            # If source is "ollama", LSW's default_embedding_model_ollama will be used.
+  ltm_vector_store_embedding_source: "ollama"  # "st" (SentenceTransformer via LSW) or "ollama" (Ollama model via LSW)
+                                           # "st" is good for local, consistent embeddings if ST model is good.
+  # ltm_vector_store_embedding_model_name: "all-MiniLM-L6-v2" # Optional: if source is 'st' and you want to override LSW's default_st_model for LTM VS.
+                                                              # Or if source is 'ollama' and you want to override LSW's default_ollama_model for LTM VS.
+                                                              # If commented out, LSWEmbeddingFunctionForMMU will use LSW's configured default for the chosen source.
 
 # Conversation Orchestrator (CO) Configuration
 orchestrator:
-  # Default LLM model for CO responses will use lsw.default_chat_model if not specified here
-  # default_llm_model: "gemma3:4b-it-fp16" # Can override LSW default for CO specifically
-  target_max_prompt_tokens: 7000
-  default_top_k_vector_search: 3
-  min_tokens_for_user_statement_to_vector_store: 10
-  max_tokens_per_ltm_vector_chunk: 500
-  target_summary_tokens_for_ltm_chunk: 150
-  # Fact Extraction filtering settings
+  # default_llm_model: "gemma3:4b-it-fp16" # If commented out, CO uses lsw.default_chat_model. Explicit is fine too.
+  target_max_prompt_tokens: 7000 # Good for an 8k effective context window.
+  default_top_k_vector_search: 3 # Reasonable.
+  min_tokens_for_user_statement_to_vector_store: 10 # Good threshold.
+  max_tokens_per_ltm_vector_chunk: 500 # Good threshold to trigger summarization.
+  target_summary_tokens_for_ltm_chunk: 150 # Good target for summaries.
+  
   fact_extraction:
     min_meaningful_length_for_filter: 3
-    # More comprehensive list of common fillers/stop words for filtering extracted facts
     common_fillers_for_filter: [
       "is", "are", "was", "were", "am", "be", "the", "a", "an", 
       "my", "me", "i", "it", "this", "that", "and", "or", "for", "to",
@@ -59,19 +54,16 @@ orchestrator:
       "what", "where", "when", "who", "why", "how", "do", "can", 
       "will", "may", "should", "could", "would", "not"
     ]
-    # Question indicators for filtering facts extracted from questions
     question_indicators_for_filter: [
       "what", "where", "when", "who", "why", "how", 
-      "do you", "can you", "is there", "are there", "is your" # "is your" from previous filter logic
+      "do you", "can you", "is there", "are there", "is your"
     ]
 
-
-# Agent specific model overrides (optional)
-# If you want specific agents to use different models than CO's default or LSW's default
+# Agent specific model overrides
 agents:
-  summarization_agent_model: "gemma3:1b-it-fp16" # Smaller model for summarization tasks
-  fact_extraction_agent_model: "gemma3:1b-it-fp16" # Smaller model for fact extraction
-  # knowledge_retriever does not use an LLM directly
+  # If these agents should use a different (perhaps smaller/faster) model than the CO's main chat model
+  summarization_agent_model: "gemma3:4b-it-fp16" # Good choice for a faster summarizer. Ensure pulled.
+  fact_extraction_agent_model: "gemma3:4b-it-fp16" # Good choice for faster fact extraction. Ensure pulled.
 
 # Data directory (base for relative paths above)
 data_dir: "data"

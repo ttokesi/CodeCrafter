@@ -34,7 +34,7 @@ class KnowledgeRetrieverAgent:
         if not isinstance(mmu, MemoryManagementUnit):
             raise TypeError("KnowledgeRetrieverAgent requires an instance of MemoryManagementUnit.")
         self.mmu = mmu
-        print("KnowledgeRetrieverAgent initialized.")
+        #print("KnowledgeRetrieverAgent initialized.")
 
     def search_knowledge(self,
                          query_text: str,
@@ -64,12 +64,12 @@ class KnowledgeRetrieverAgent:
 
             # --- STRATEGY 1: Targeted S-P-O Search (if provided) ---
             if skb_subject or skb_predicate or skb_object:
-                print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
+                #print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
                 try:
                     targeted_facts = self.mmu.get_ltm_facts(
                         subject=skb_subject, predicate=skb_predicate, object_value=skb_object
                     )
-                    print(f"  KRA_DEBUG: Targeted search found {len(targeted_facts)} fact(s).")
+                    #print(f"  KRA_DEBUG: Targeted search found {len(targeted_facts)} fact(s).")
                     for fact in targeted_facts:
                         if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
                 except Exception as e:
@@ -80,7 +80,7 @@ class KnowledgeRetrieverAgent:
             # For now, let's make it run if specific S,P,O are not set by the caller.
             # We might want to make this logic more sophisticated later, e.g. always try patterns.
             if query_text and not (skb_subject or skb_predicate or skb_object):
-                print(f"  KRA_DEBUG: Attempting pattern-based SKB search for query: '{query_text}'")
+                #print(f"  KRA_DEBUG: Attempting pattern-based SKB search for query: '{query_text}'")
                 # Pattern 1: "What is my X?" -> search for subject "user X" or "user's X"
                 match_my_x = re.search(r"what is my ([\w\s]+)\??", query_text.lower())
                 if match_my_x:
@@ -88,7 +88,7 @@ class KnowledgeRetrieverAgent:
                     # Search for canonical subjects our FactExtractor might create
                     potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"] # Handle plurals simply
                     for potential_subject in potential_subjects:
-                        print(f"    KRA_DEBUG: Pattern 'What is my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
+                        #print(f"    KRA_DEBUG: Pattern 'What is my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
                         facts_pattern = self.mmu.get_ltm_facts(subject=f"%{potential_subject}%", predicate="is") # Often "is"
                         for fact in facts_pattern:
                             if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
@@ -101,7 +101,7 @@ class KnowledgeRetrieverAgent:
                     entity = match_remember_my_x.group(1).strip()
                     potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"]
                     for potential_subject in potential_subjects:
-                        print(f"    KRA_DEBUG: Pattern 'Do you remember my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
+                        #print(f"    KRA_DEBUG: Pattern 'Do you remember my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
                         facts_pattern = self.mmu.get_ltm_facts(subject=f"%{potential_subject}%", predicate="is")
                         for fact in facts_pattern:
                             if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
@@ -123,7 +123,7 @@ class KnowledgeRetrieverAgent:
                         keywords.append(kw_cleaned)
                 
                 if keywords: # Only print if there are actual keywords to search
-                    print(f"  KRA_DEBUG: Performing general keyword-based SKB search. Cleaned Keywords: {keywords}")
+                    #print(f"  KRA_DEBUG: Performing general keyword-based SKB search. Cleaned Keywords: {keywords}")
                     for keyword in set(keywords):
                         if not keyword: continue
                         # print(f"    KRA_DEBUG: Querying SKB with general keyword '{keyword}'...") # Can be verbose
@@ -139,10 +139,10 @@ class KnowledgeRetrieverAgent:
                             print(f"    Error during general keyword-based SKB fact search for '{keyword}': {e}")
             
             results["skb_fact_results"] = list(found_skb_facts_dict.values())
-            if results["skb_fact_results"]:
-                print(f"  KRA: Found {len(results['skb_fact_results'])} unique fact(s) from SKB based on query/params.")
-            else:
-                print(f"  KRA: No unique facts found in SKB for this query/params.")
+            #if results["skb_fact_results"]:
+                #print(f"  KRA: Found {len(results['skb_fact_results'])} unique fact(s) from SKB based on query/params.")
+            #else:
+                #print(f"  KRA: No unique facts found in SKB for this query/params.")
         
         return results
 
@@ -164,7 +164,7 @@ class SummarizationAgent:
             raise TypeError("SummarizationAgent requires an instance of LLMServiceWrapper.")
         self.lsw = lsw
         self.default_model_name = default_model_name if default_model_name else self.lsw.default_chat_model
-        print(f"SummarizationAgent initialized. Default summarization model: {self.default_model_name}")
+        #print(f"SummarizationAgent initialized. Default summarization model: {self.default_model_name}")
 
     def summarize_text(self,
                        text_to_summarize: str,
@@ -213,7 +213,7 @@ class SummarizationAgent:
             {"role": "user", "content": prompt_content}
         ]
 
-        print(f"\nSummarizationAgent: Requesting summary from model '{model_to_use}' (max_length ~{max_summary_length} tokens, temp={temperature}).")
+        # print(f"\nSummarizationAgent: Requesting summary from model '{model_to_use}' (max_length ~{max_summary_length} tokens, temp={temperature}).")
         # print(f"  Prompt content being sent (first 100 chars): {prompt_content[:100]}...")
 
 
@@ -226,7 +226,7 @@ class SummarizationAgent:
         )
 
         if summary_response:
-            print(f"  Summary generated: \"{summary_response[:100].strip()}...\"")
+            #print(f"  Summary generated: \"{summary_response[:100].strip()}...\"")
             return summary_response.strip()
         else:
             print("  Summarization failed or LLM returned no response.")
@@ -250,7 +250,7 @@ class FactExtractionAgent:
             raise TypeError("FactExtractionAgent requires an instance of LLMServiceWrapper.")
         self.lsw = lsw
         self.default_model_name = default_model_name if default_model_name else self.lsw.default_chat_model
-        print(f"FactExtractionAgent initialized. Default extraction model: {self.default_model_name}")
+        #print(f"FactExtractionAgent initialized. Default extraction model: {self.default_model_name}")
 
     def extract_facts(self,
                       text_to_process: str,
@@ -318,8 +318,8 @@ class FactExtractionAgent:
             {"role": "user", "content": prompt_content}
         ]
 
-        print(f"\nFactExtractionAgent: Requesting fact extraction from model '{model_to_use}' (temp={temperature}).")
-        print(f"  Prompt content being sent (first 150 chars for brevity): {prompt_content[:150]}...")
+        #print(f"\nFactExtractionAgent: Requesting fact extraction from model '{model_to_use}' (temp={temperature}).")
+        #print(f"  Prompt content being sent (first 150 chars for brevity): {prompt_content[:150]}...")
 
         # Requesting JSON output from Ollama model
         # Some models support a 'format: json' parameter in options for more reliable JSON.
@@ -374,7 +374,7 @@ class FactExtractionAgent:
                 else:
                     print(f"  FactExtractionAgent: Skipping malformed fact item: {fact_item}")
             
-            print(f"  Successfully extracted {len(valid_facts)} facts.")
+            #print(f"  Successfully extracted {len(valid_facts)} facts.")
             return valid_facts
 
         except json.JSONDecodeError as e:

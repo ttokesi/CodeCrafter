@@ -416,7 +416,7 @@ class VectorStoreChroma:
                 # For now, assume Chroma can use the passed callable directly.
             )
             print(f"VectorStoreChroma: ChromaDB collection '{self.collection_name}' loaded/created successfully from '{self.persist_directory}'.")
-            print(f"  Using provided embedding function: {embedding_function.__name__ if hasattr(embedding_function, '__name__') else type(embedding_function)}")
+            #print(f"  Using provided embedding function: {embedding_function.__name__ if hasattr(embedding_function, '__name__') else type(embedding_function)}")
             print(f"  Current item count in collection: {self.collection.count()}")
         except Exception as e:
             print(f"VectorStoreChroma: Error initializing ChromaDB client or collection: {e}")
@@ -594,7 +594,7 @@ class LTMManager:
         self.db_path = db_path
         # self.chroma_persist_dir = chroma_persist_dir # Not needed to store if passed directly
         
-        print(f"LTMManager: Initializing with DB: '{db_path}', Chroma Dir: '{chroma_persist_dir}'")
+        #print(f"LTMManager: Initializing with DB: '{db_path}', Chroma Dir: '{chroma_persist_dir}'")
 
         self.raw_log = RawConversationLog(db_path=self.db_path)
         self.skb = StructuredKnowledgeBase(db_path=self.db_path)
@@ -603,7 +603,7 @@ class LTMManager:
             persist_directory=chroma_persist_dir, # Pass it through
             embedding_function=embedding_function   # Pass it through
         )
-        print("LTMManager: All LTM components initialized.")
+        #print("LTMManager: All LTM components initialized.")
 
     # Expose methods from raw_log
     def log_interaction(self, *args, **kwargs): return self.raw_log.log_interaction(*args, **kwargs)
@@ -727,7 +727,7 @@ if __name__ == "__main__":
     class MockLtmTestEmbeddingFunction(EmbeddingFunction):
         def __init__(self, dim: int = 10):
             self.dim = dim
-            print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
+            #print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
 
         # This is the method ChromaDB will call.
         # It MUST be named __call__ and take 'self' and 'input'.
@@ -737,7 +737,7 @@ if __name__ == "__main__":
             if not input: # Handle empty input list
                 return []
                 
-            print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} document(s). Example: '{str(input[0])[:30] if input else 'N/A'}'")
+            #print(f"  LTM_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} document(s). Example: '{str(input[0])[:30] if input else 'N/A'}'")
             
             embeddings_list: Embeddings = []
             for _ in range(len(input)):

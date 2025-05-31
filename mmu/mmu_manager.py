@@ -135,7 +135,7 @@ class MediumTermMemory:
                 self.entities_table = self.db.table('entities')
                 self.context_table = self.db.table('task_context')
                 self.is_persistent = True
-                print(f"MTM: Using TinyDB for persistence at '{db_path}'.")
+                #print(f"MTM: Using TinyDB for persistence at '{db_path}'.")
             except Exception as e:
                 print(f"MTM: Error initializing TinyDB at '{db_path}'. Falling back to in-memory. Error: {e}")
                 self._initialize_in_memory_stores()
@@ -271,10 +271,10 @@ class MemoryManagementUnit:
             raise TypeError("MemoryManagementUnit requires a callable embedding_function for LTM.")
 
         if config is None:
-            print("MMU: Loading global configuration...")
+            #print("MMU: Loading global configuration...")
             config = get_config()
-        else:
-            print("MMU: Using provided configuration dictionary.")
+        #else:
+        #    print("MMU: Using provided configuration dictionary.")
             
         mmu_config = config.get('mmu', {})
         project_r = get_project_root()
@@ -436,10 +436,10 @@ if __name__ == "__main__":
     class MockMMUTestEmbeddingFunction(EmbeddingFunction): # Inherit from Chroma's base
         def __init__(self, dim: int = 10):
             self.dim = dim
-            print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
+            #print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: Initialized with dim={self.dim}")
         def __call__(self, input: Documents) -> Embeddings:
             if not input: return []
-            print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} doc(s).")
+            #print(f"  MMU_TEST_MOCK_EMBEDDER_CLASS: __call__ received {len(input)} doc(s).")
             return [[0.0] * self.dim for _ in range(len(input))]
     
     mock_embed_func_for_mmu = MockMMUTestEmbeddingFunction(dim=100) # Instance

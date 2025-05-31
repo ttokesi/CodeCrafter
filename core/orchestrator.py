@@ -83,7 +83,7 @@ class ConversationOrchestrator:
                                    user_query: str,
                                    retrieved_knowledge: dict
                                   ) -> list:
-        print("  CO: Building prompt with context...")
+        #print("  CO: Building prompt with context...")
         target_ollama_model_for_tokens = self.default_llm_model 
         summarization_llm_model = self.summarizer.default_model_name
 
@@ -199,7 +199,7 @@ class ConversationOrchestrator:
             print(f"  CO: STM cleared for new conversation session '{conversation_id}'.")
         
         self.active_conversation_id = conversation_id 
-        print(f"\nCO: Handling user message for conversation '{conversation_id}': '{user_message}'")
+        #print(f"\nCO: Handling user message for conversation '{conversation_id}': '{user_message}'")
         
         # Use self.fe_question_indicators_check from config
         is_likely_question = user_message.endswith("?") or \
@@ -211,7 +211,7 @@ class ConversationOrchestrator:
         extracted_facts_from_user = self.fact_extractor.extract_facts(text_to_process=user_message)
         
         if extracted_facts_from_user: # Facts were potentially extracted by agent
-            print(f"  CO: Raw extracted {len(extracted_facts_from_user)} fact(s) from user message by FactExtractionAgent.")
+            #print(f"  CO: Raw extracted {len(extracted_facts_from_user)} fact(s) from user message by FactExtractionAgent.")
             filtered_facts_to_store = []
             if is_likely_question: 
                 print(f"    CO_FILTER: User message appears to be a question. Discarding for SKB.")
@@ -229,7 +229,7 @@ class ConversationOrchestrator:
             if filtered_facts_to_store: # This block only runs if not a question AND facts survived filtering
                 print(f"  CO: Storing {len(filtered_facts_to_store)} filtered fact(s) to LTM/SKB.")
                 for fact_to_store in filtered_facts_to_store:
-                     print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'")
+                     #print(f"    CO: Storing fact: S='{fact_to_store['subject']}', P='{fact_to_store['predicate']}', O='{fact_to_store['object']}'")
                      self.mmu.store_ltm_fact(subject=fact_to_store['subject'],predicate=fact_to_store['predicate'],object_value=fact_to_store['object'],confidence=0.80)
 
         # KRA Search (uses self.default_top_k_vector_search from config)
@@ -294,7 +294,7 @@ class ConversationOrchestrator:
         print(f"  CO: Preparing to log to LTM for conversation '{self.active_conversation_id}'.")
         current_ltm_history_len = len(self.mmu.get_ltm_conversation_history(self.active_conversation_id))
         user_turn_seq_id = current_ltm_history_len + 1
-        print(f"    LTM logging: User turn seq ID: {user_turn_seq_id} for '{user_message[:30]}...'")
+        #print(f"    LTM logging: User turn seq ID: {user_turn_seq_id} for '{user_message[:30]}...'")
         user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(self.active_conversation_id, user_turn_seq_id, "user", user_message)
 
         # Vector Store Learning (uses self.min_tokens_for_vs_learn)
