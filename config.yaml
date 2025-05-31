@@ -34,8 +34,10 @@ mmu:
   ltm_sqlite_db_path: "data/ltm_database.db" # Relative to project root
   ltm_chroma_persist_directory: "data/ltm_vector_store" # Relative to project root
   
-  # LTM VectorStoreChroma (within ltm.py) specific setting (if needed, though it currently uses ST default)
-  # ltm_vector_store_embedding_model_st: "all-MiniLM-L6-v2" # This is handled by LSW now effectively or ST default
+  ltm_vector_store_embedding_source: "st"  # "st" or "ollama" - default "st" if not present
+  # ltm_vector_store_embedding_model_name: "all-MiniLM-L6-v2" # Optional: if you want LTM VS to use a specific ST model via LSW,
+                                                            # otherwise LSW's default_embedding_model_st will be used.
+                                                            # If source is "ollama", LSW's default_embedding_model_ollama will be used.
 
 # Conversation Orchestrator (CO) Configuration
 orchestrator:
