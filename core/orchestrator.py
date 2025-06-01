@@ -90,7 +90,7 @@ class ConversationOrchestrator:
         print(f"  CO - STM Token Budget Ratio: {self.target_stm_tokens_budget_ratio}")
         print(f"  CO - STM Summary Target Tokens: {self.stm_summary_target_tokens}")
         # --- End print statements ---
-        
+
     def _build_prompt_with_context(self,
                                    conversation_id: str, # No longer needed as param if self.active_conversation_id is used
                                    user_query: str,
@@ -158,37 +158,121 @@ class ConversationOrchestrator:
                     knowledge_context_str_parts.append(f"  - {res_str}"); current_total_tokens += res_tokens
                 else: break
         retrieved_knowledge_prompt_str = "\n".join(knowledge_context_str_parts)
+        print(f"    Tokens - System + LTM context: {current_total_tokens}")
 
-        # STM History
-        stm_history_turns = self.mmu.get_stm_history()
+        # --- New STM Management Logic ---
+        stm_history_turns_original = self.mmu.get_stm_history() # Get all current STM turns
+
+        # The user_query for the *current* turn is NOT yet in stm_history_turns_original
+        # because we add it to STM *after* the LLM call in handle_user_message.
+        # So, stm_history_turns_original represents history *before* the current user_query.
+
+        managed_stm_turns_for_prompt = [] # This will hold the STM turns we decide to include
+
+        if self.manage_stm_within_prompt and stm_history_turns_original:
+            user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens)
+            
+            # Calculate remaining budget *before* considering STM or the current user_query
+            remaining_budget_for_stm_and_query = self.target_max_prompt_tokens - current_total_tokens
+            
+            # Calculate the specific budget for STM based on the ratio
+            stm_token_budget = int(remaining_budget_for_stm_and_query * self.target_stm_tokens_budget_ratio)
+            print(f"    Tokens - Budget available for STM & User Query: {remaining_budget_for_stm_and_query}")
+            print(f"    Tokens - Calculated STM Token Budget (ratio {self.target_stm_tokens_budget_ratio}): {stm_token_budget}")
+
+            if self.stm_condensation_strategy == "truncate":
+                current_stm_tokens_in_budget = 0
+                # Iterate from newest to oldest STM turns (reversed) to prioritize recent history
+                truncated_older_turn = False
+                for turn in reversed(stm_history_turns_original):
+                    turn_str_temp = f"{turn['role'].capitalize()}: {turn['content']}" # For token counting
+                    turn_tokens_temp = count_tokens(turn_str_temp, target_ollama_model_for_tokens)
+                    
+                    if current_stm_tokens_in_budget + turn_tokens_temp <= stm_token_budget:
+                        managed_stm_turns_for_prompt.insert(0, turn) # Add to beginning to maintain order
+                        current_stm_tokens_in_budget += turn_tokens_temp
+                    else:
+                        # This turn_tokens_temp is the one that didn't fit
+                        print(f"    STM Truncation: Oldest considered STM turn ({turn_tokens_temp} tokens) for '{turn_str_temp[:30]}...' did not fit remaining STM budget ({stm_token_budget - current_stm_tokens_in_budget} left).")
+                        truncated_older_turn = True
+                        break 
+                                # This print might be more informative
+                if not stm_history_turns_original:
+                    print(f"    Tokens - STM: No prior STM turns to consider for this prompt.")
+                elif not truncated_older_turn and stm_history_turns_original:
+                    print(f"    Tokens - STM: All {len(stm_history_turns_original)} STM turns fit within budget.")
+                print(f"    Tokens - STM after truncation: {current_stm_tokens_in_budget} from {len(managed_stm_turns_for_prompt)} turns.")
+            
+            elif self.stm_condensation_strategy == "summarize":
+                # Placeholder for summarization logic (to be implemented in a later step)
+                print(f"    STM Condensation: Summarization strategy selected but not yet implemented. Using original STM for now.")
+                managed_stm_turns_for_prompt = list(stm_history_turns_original) # Fallback for now
+            
+            else: # Unknown strategy or feature disabled implicitly
+                managed_stm_turns_for_prompt = list(stm_history_turns_original)
+
+        else: # STM management disabled or no STM history
+            managed_stm_turns_for_prompt = list(stm_history_turns_original)
+        # --- End New STM Management Logic ---
+
+        # Now, build the stm_prompt_parts string from managed_stm_turns_for_prompt
+        # And ensure the *total* prompt doesn't exceed target_max_prompt_tokens
         stm_prompt_parts = []
-        user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens)
-        stm_for_prompt_build = stm_history_turns
-        if stm_for_prompt_build and stm_for_prompt_build[-1].get("role") == "user" and stm_for_prompt_build[-1].get("content") == user_query:
-            stm_for_prompt_build = stm_history_turns[:-1]
-        for turn_idx, turn in enumerate(reversed(stm_for_prompt_build)):
+        # `current_total_tokens` here is still system_msg + LTM_context.
+        # We need to add the tokens of the chosen STM turns to it.
+
+        actual_stm_tokens_added = 0
+        user_query_tokens = count_tokens(user_query, target_ollama_model_for_tokens) # Recalculate for safety or pass from above
+
+        for turn in managed_stm_turns_for_prompt: # Iterate through the (potentially truncated) STM turns
             turn_str = f"{turn['role'].capitalize()}: {turn['content']}"
             turn_tokens = count_tokens(turn_str, target_ollama_model_for_tokens)
-            if current_total_tokens + turn_tokens + user_query_tokens < self.target_max_prompt_tokens: # USE SELF.
-                stm_prompt_parts.insert(0, turn_str); current_total_tokens += turn_tokens
-            else: break
+            
+            # Check against the *overall* prompt budget
+            if current_total_tokens + actual_stm_tokens_added + turn_tokens + user_query_tokens < self.target_max_prompt_tokens:
+                stm_prompt_parts.append(turn_str) # Append to maintain chronological order for final string
+                actual_stm_tokens_added += turn_tokens
+            else:
+                # This is a final safety break if, even after STM budget management,
+                # adding the next managed STM turn would exceed the *total* prompt limit.
+                print(f"    Tokens - STM turn skipped (FINAL BUDGET CHECK): {turn_tokens} for '{turn_str[:30]}...'")
+                break
+                
+        current_total_tokens += actual_stm_tokens_added # Update total tokens with actual STM used
         stm_history_prompt_str = "\n".join(stm_prompt_parts)
-        
-        # Final Assembly
+        print(f"    Tokens - Actual STM history added to prompt: {actual_stm_tokens_added}")
+
+        # Final Assembly (this part remains largely the same, but uses the new stm_history_prompt_str)
         full_user_prompt_content_parts = []
-        if stm_history_prompt_str:
-            full_user_prompt_content_parts.append("Relevant Conversation History:\n"); full_user_prompt_content_parts.append(stm_history_prompt_str)
+        if stm_history_prompt_str: # Only add if there's STM content
+            full_user_prompt_content_parts.append("Relevant Conversation History:\n")
+            full_user_prompt_content_parts.append(stm_history_prompt_str)
+
         if retrieved_knowledge_prompt_str:
-            if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n") 
-            full_user_prompt_content_parts.append("RETRIEVED KNOWLEDGE CONTEXT:\n"); full_user_prompt_content_parts.append(retrieved_knowledge_prompt_str)
-        if full_user_prompt_content_parts: full_user_prompt_content_parts.append("\n\n") 
+            if full_user_prompt_content_parts: 
+                full_user_prompt_content_parts.append("\n") # Add a newline if STM was also present
+            full_user_prompt_content_parts.append("RETRIEVED KNOWLEDGE CONTEXT:\n")
+            full_user_prompt_content_parts.append(retrieved_knowledge_prompt_str)
+
+        if full_user_prompt_content_parts: # If either STM or LTM context was added
+            full_user_prompt_content_parts.append("\n\n") # Add spacing before user query
+            
         full_user_prompt_content_parts.append(f"User Query: {user_query}")
         final_user_content = "".join(full_user_prompt_content_parts)
-        final_user_content_tokens = count_tokens(final_user_content, target_ollama_model_for_tokens)
-        final_prompt_total_tokens = system_tokens + final_user_content_tokens
-        print(f"  CO: Final total prompt tokens: {final_prompt_total_tokens} (Target: {self.target_max_prompt_tokens})") # USE SELF.
-        if final_prompt_total_tokens > self.target_max_prompt_tokens: # USE SELF.
-            print(f"  CO: WARNING - Final prompt tokens ({final_prompt_total_tokens}) exceeded target.")
+
+        # The system message is added separately when constructing the `messages` list for the LLM
+        # So, the token count for `final_user_content` is just for the user role part.
+        # final_user_content_tokens = count_tokens(final_user_content, target_ollama_model_for_tokens)
+
+        # `current_total_tokens` now includes system, LTM, and chosen STM. Add user_query for final check.
+        final_prompt_total_tokens = current_total_tokens + user_query_tokens
+
+        print(f"  CO: Final total prompt tokens: {final_prompt_total_tokens} (Target: {self.target_max_prompt_tokens})")
+        if final_prompt_total_tokens > self.target_max_prompt_tokens:
+            print(f"  CO: WARNING - Final prompt tokens ({final_prompt_total_tokens}) exceeded target AFTER STM management.")
+            # Potentially, we could truncate final_user_content here as a last resort,
+            # but it's better if the budgeting prevents this.
+            
         messages.append({"role": "user", "content": final_user_content})
         return messages
 
