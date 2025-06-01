@@ -112,7 +112,7 @@ class ConversationOrchestrator:
             "If the retrieved context does not contain enough information, use your general knowledge but clearly state that the information is not from your specific knowledge base. "
             "If you cannot answer the question based on either retrieved context or general knowledge, say so clearly. "
             "Do not invent facts or information. Be concise unless asked for detail. "
-            "If you use information from the 'RETRIEVED KNOWLEDGE CONTEXT', try to subtly indicate that you are recalling specific information (e.g., 'Based on what we discussed earlier about X...' or 'I found some information relating to Y...')."
+            "When you use information directly from the 'RETRIEVED KNOWLEDGE CONTEXT' to answer, confidently state that you are recalling this specific information (e.g., 'I recall that X...' or 'Based on what I have in my knowledge base about Y...'). If the context is partial, you can say 'I have some information indicating that...'."  # <-- MODIFIED LINE
         )
         system_tokens = count_tokens(system_message_content, target_ollama_model_for_tokens)
         current_total_tokens = system_tokens

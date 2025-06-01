@@ -312,6 +312,7 @@ class FactExtractionAgent:
             f"Format your output STRICTLY as a JSON list of objects. Each object must have 'subject', 'predicate', and 'object' keys, and their values must be strings.\n"
             f"If the USER'S STATEMENT contains no clear, distinct factual claims or is a question, return an empty JSON list [].\n"
             f"Avoid extracting trivial, overly fragmented, or nonsensical statements. Focus on information that seems intended to be remembered.\n\n"
+            f"CRITICAL: Do NOT extract any information from the examples provided below; only extract from the actual USER'S STATEMENT at the end.\n\n"
             f"Example of GOOD extractions for USER STATEMENTS:\n"
             f"USER'S STATEMENT: \"My name is Alex and I work as a software developer in New York.\"\n"
             f"Output:\n"
