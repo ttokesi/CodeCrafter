@@ -4,6 +4,9 @@ import os
 import shutil  
 import time    
 import gc      
+import datetime
+import json
+
 
 # Conditional imports
 if __name__ == '__main__' and __package__ is None:
@@ -55,7 +58,7 @@ class ConversationOrchestrator:
         self.fact_extractor = fact_extractor
         
         co_config = config.get('orchestrator', {})
-        lsw_config = config.get('lsw', {}) # For LSW default chat model as fallback
+        #lsw_config = config.get('lsw', {}) # For LSW default chat model as fallback
 
         # Use CO's specific default model if defined in config, else LSW's default from its own config loading
         self.default_llm_model = co_config.get('default_llm_model', lsw.default_chat_model)
@@ -204,9 +207,98 @@ class ConversationOrchestrator:
                 print(f"    Tokens - STM after truncation: {current_stm_tokens_in_budget} from {len(managed_stm_turns_for_prompt)} turns.")
             
             elif self.stm_condensation_strategy == "summarize":
-                # Placeholder for summarization logic (to be implemented in a later step)
-                print(f"    STM Condensation: Summarization strategy selected but not yet implemented. Using original STM for now.")
-                managed_stm_turns_for_prompt = list(stm_history_turns_original) # Fallback for now
+                print(f"    STM Condensation: Attempting 'summarize' strategy.")
+                print(f"      DEBUG: Initial stm_history_turns_original: {json.dumps(stm_history_turns_original, indent=2)}") # DEBUG PRINT
+                
+                managed_stm_turns_for_prompt = [] 
+                temp_turns_to_keep_verbatim = []
+                temp_turns_to_summarize = [] 
+                accumulated_verbatim_tokens = 0
+
+                # Only operate on actual historical turns
+                if stm_history_turns_original:
+                    #print(f"      DEBUG: Processing {len(stm_history_turns_original)} historical STM turns.") # DEBUG PRINT
+                    # Iterate from newest to oldest to decide what fits verbatim
+                    for i in range(len(stm_history_turns_original) - 1, -1, -1):
+                        turn_to_check = stm_history_turns_original[i]
+                        turn_str_temp = f"{turn_to_check['role'].capitalize()}: {turn_to_check['content']}"
+                        turn_tokens_temp = count_tokens(turn_str_temp, target_ollama_model_for_tokens)
+                        
+                        #print(f"        DEBUG: Checking turn (idx {i}): '{turn_str_temp[:50]}...' ({turn_tokens_temp} tokens)") # DEBUG PRINT
+                        #print(f"        DEBUG: Current verbatim tokens: {accumulated_verbatim_tokens}, STM budget: {stm_token_budget}") # DEBUG PRINT
+
+                        if (accumulated_verbatim_tokens + turn_tokens_temp) <= stm_token_budget:
+                            temp_turns_to_keep_verbatim.insert(0, turn_to_check) 
+                            accumulated_verbatim_tokens += turn_tokens_temp
+                            #print(f"          DEBUG: Added to verbatim. New verbatim tokens: {accumulated_verbatim_tokens}") # DEBUG PRINT
+                        else:
+                            #print(f"          DEBUG: Turn too large. Moving this and older to 'to_summarize'.") # DEBUG PRINT
+                            temp_turns_to_summarize = list(stm_history_turns_original[0 : i + 1])
+                            break 
+                    
+                    if not temp_turns_to_summarize and temp_turns_to_keep_verbatim: # All historical turns fit verbatim
+                        managed_stm_turns_for_prompt = list(temp_turns_to_keep_verbatim) # Assign if all fit
+                
+                # --- At this point:
+                # temp_turns_to_keep_verbatim contains newest historical turns that fit the budget.
+                # temp_turns_to_summarize contains oldest historical turns that did not fit verbatim.
+                # If stm_history_turns_original was empty, both lists are empty.
+                
+                print(f"      STM Summarize: Kept {len(temp_turns_to_keep_verbatim)} recent turn(s) verbatim ({accumulated_verbatim_tokens} tokens).")
+
+
+                # --- Summarization block: ONLY execute if temp_turns_to_summarize was populated by historical processing ---
+                if temp_turns_to_summarize: # This list is ONLY populated from stm_history_turns_original processing block
+                    print(f"      STM Summarize: {len(temp_turns_to_summarize)} older turn(s) are candidates for summarization.")
+                    # ... (the rest of your summarization logic using temp_turns_to_summarize, text_block_to_summarize, etc.)
+                    # ... (assign to managed_stm_turns_for_prompt based on summary success/failure)
+                    # Make sure that if summarization is skipped/fails, managed_stm_turns_for_prompt is set to temp_turns_to_keep_verbatim
+                    # Example from previous correct logic:
+                    text_block_to_summarize_parts = [f"{t['role'].capitalize()}: {t['content']}" for t in temp_turns_to_summarize]
+                    text_block_to_summarize = "\n".join(text_block_to_summarize_parts)
+                    original_block_tokens = count_tokens(text_block_to_summarize, target_ollama_model_for_tokens)
+                    print(f"      STM Summarize: Original token count of block to summarize: {original_block_tokens}")
+
+                    remaining_budget_for_summary = stm_token_budget - accumulated_verbatim_tokens
+
+                    if original_block_tokens > self.stm_summary_target_tokens + 50 and \
+                    remaining_budget_for_summary > self.stm_summary_target_tokens // 2:
+                        print(f"      STM Summarize: Calling SummarizationAgent for older STM turns (target tokens: {self.stm_summary_target_tokens}).")
+                        summary_of_older_stm = self.summarizer.summarize_text(
+                            text_to_summarize=text_block_to_summarize,
+                            model_name=self.summarizer.default_model_name, 
+                            max_summary_length=self.stm_summary_target_tokens,
+                            temperature=0.3 
+                        )
+                        if summary_of_older_stm:
+                            summary_tokens = count_tokens(summary_of_older_stm, target_ollama_model_for_tokens)
+                            print(f"      STM Summarize: Generated summary ({summary_tokens} tokens): \"{summary_of_older_stm[:100].strip()}...\"")
+                            if summary_tokens <= remaining_budget_for_summary:
+                                summary_turn = {"role": "system", "content": f"[Summary of earlier conversation]: {summary_of_older_stm}", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                                managed_stm_turns_for_prompt = [summary_turn] + temp_turns_to_keep_verbatim 
+                            else:
+                                print(f"      STM Summarize: Generated summary ({summary_tokens} tokens) is too long for remaining budget ({remaining_budget_for_summary}). Discarding summary, keeping verbatim.")
+                                managed_stm_turns_for_prompt = list(temp_turns_to_keep_verbatim) 
+                        else:
+                            print(f"      STM Summarize: Summarization failed. Discarding older turns, keeping verbatim.")
+                            managed_stm_turns_for_prompt = list(temp_turns_to_keep_verbatim) 
+                    else: 
+                        print(f"      STM Summarize: Block of older turns not summarized (too small or budget insufficient). Keeping verbatim turns only.")
+                        managed_stm_turns_for_prompt = list(temp_turns_to_keep_verbatim)
+                
+                elif not stm_history_turns_original: # No historical STM at all
+                    print(f"      STM Summarize: No historical STM to process.")
+                    managed_stm_turns_for_prompt = [] 
+                else: # All historical STM fit verbatim (temp_turns_to_summarize is empty, but stm_history_turns_original was not)
+                    print(f"      STM Summarize: All historical STM turns fit verbatim, no summarization needed.")
+                    managed_stm_turns_for_prompt = list(temp_turns_to_keep_verbatim)
+
+
+                current_stm_tokens_in_prompt = 0
+                for turn in managed_stm_turns_for_prompt:
+                    current_stm_tokens_in_prompt += count_tokens(f"{turn['role'].capitalize()}: {turn['content']}", target_ollama_model_for_tokens)
+                
+                print(f"    Tokens - STM after summarization attempt: {current_stm_tokens_in_prompt} from {len(managed_stm_turns_for_prompt)} effective turns.")
             
             else: # Unknown strategy or feature disabled implicitly
                 managed_stm_turns_for_prompt = list(stm_history_turns_original)

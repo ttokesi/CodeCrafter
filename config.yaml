@@ -47,7 +47,7 @@ orchestrator:
 
   # --- New STM Management Settings ---
   manage_stm_within_prompt: true              # Enable/disable STM management in prompt building
-  stm_condensation_strategy: "truncate"       # "truncate" or "summarize" (implement truncate first)
+  stm_condensation_strategy: "summarize"       # "truncate" or "summarize" (implement truncate first)
   target_stm_tokens_budget_ratio: 0.5         # Ratio of remaining token budget for STM (e.g., 0.5 means STM can use 50% of what's left after sys prompt & LTM)
   stm_summary_target_tokens: 200              # Target tokens for a summarized STM block (if strategy is "summarize")
   # --- End New STM Management Settings ---
