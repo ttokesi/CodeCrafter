@@ -80,19 +80,38 @@ class KnowledgeRetrieverAgent:
             # For now, let's make it run if specific S,P,O are not set by the caller.
             # We might want to make this logic more sophisticated later, e.g. always try patterns.
             if query_text and not (skb_subject or skb_predicate or skb_object):
-                #print(f"  KRA_DEBUG: Attempting pattern-based SKB search for query: '{query_text}'")
+                print(f"  KRA_DEBUG: Attempting pattern-based SKB search for query: '{query_text}'")
                 # Pattern 1: "What is my X?" -> search for subject "user X" or "user's X"
-                match_my_x = re.search(r"what is my ([\w\s]+)\??", query_text.lower())
-                if match_my_x:
-                    entity = match_my_x.group(1).strip()
-                    # Search for canonical subjects our FactExtractor might create
-                    potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"] # Handle plurals simply
+            match_my_x = re.search(r"what is my ([\w\s]+)\??", query_text.lower())
+            if match_my_x:
+                full_entity_match = match_my_x.group(1).strip()
+                print(f"    KRA_DEBUG: Pattern 'What is my X?' - Full matched entity: '{full_entity_match}'")
+
+                entities_to_query = []
+                if " and " in full_entity_match:
+                    print(f"    KRA_DEBUG: Detected 'and' in entity. Splitting: '{full_entity_match}'")
+                    parts = [part.strip() for part in full_entity_match.split(" and ") if part.strip()]
+                    entities_to_query.extend(parts)
+                else:
+                    entities_to_query.append(full_entity_match)
+                
+                print(f"    KRA_DEBUG: Entities to query SKB for: {entities_to_query}")
+
+                for entity in entities_to_query: # Now loop through potentially multiple entities
+                    print(f"    KRA_DEBUG: Processing split entity: '{entity}'") # Optional more debug
+                    potential_subjects = [f"user {entity}", f"user's {entity}", f"user {entity.rstrip('s')}", f"user's {entity.rstrip('s')}"]
                     for potential_subject in potential_subjects:
-                        #print(f"    KRA_DEBUG: Pattern 'What is my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
-                        facts_pattern = self.mmu.get_ltm_facts(subject=f"%{potential_subject}%", predicate="is") # Often "is"
+                        print(f"    KRA_DEBUG: Pattern 'What is my X?' -> Querying SKB for subject LIKE '%{potential_subject}%'")
+                        # Make sure your mmu.get_ltm_facts can handle LIKE if you use it, 
+                        # or use exact match if your subjects are canonical.
+                        # For now, let's assume exact match for "user <entity>" is better.
+                        facts_pattern = self.mmu.get_ltm_facts(subject=potential_subject, predicate="is") # Often "is"
                         for fact in facts_pattern:
                             if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
-                        if found_skb_facts_dict: break # Stop if we found something with first pattern
+                        if found_skb_facts_dict and entity in full_entity_match: # If we found something for this part, maybe stop for this *part*
+                            # This break is tricky with multiple entities. We want to find all parts.
+                            # So, the break should probably be inside the potential_subjects loop if a match is found FOR THAT potential_subject
+                            pass # Let it try all potential_subjects for the current entity part
 
                 # Pattern 2: "Do you remember my X?" or "Do you know my X?"
                 # -> search for subject "user X" or "user's X"
