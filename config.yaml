@@ -44,7 +44,14 @@ orchestrator:
   min_tokens_for_user_statement_to_vector_store: 10 # Good threshold.
   max_tokens_per_ltm_vector_chunk: 500 # Good threshold to trigger summarization.
   target_summary_tokens_for_ltm_chunk: 150 # Good target for summaries.
-  
+
+  # --- New STM Management Settings ---
+  manage_stm_within_prompt: true              # Enable/disable STM management in prompt building
+  stm_condensation_strategy: "truncate"       # "truncate" or "summarize" (implement truncate first)
+  target_stm_tokens_budget_ratio: 0.5         # Ratio of remaining token budget for STM (e.g., 0.5 means STM can use 50% of what's left after sys prompt & LTM)
+  stm_summary_target_tokens: 200              # Target tokens for a summarized STM block (if strategy is "summarize")
+  # --- End New STM Management Settings ---
+
   fact_extraction:
     min_meaningful_length_for_filter: 3
     common_fillers_for_filter: [

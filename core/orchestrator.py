@@ -66,10 +66,17 @@ class ConversationOrchestrator:
         self.max_tokens_ltm_chunk = co_config.get('max_tokens_per_ltm_vector_chunk', 500)
         self.target_summary_tokens_ltm = co_config.get('target_summary_tokens_for_ltm_chunk', 150)
 
+        # --- Load New STM Management Settings ---
+        self.manage_stm_within_prompt = co_config.get('manage_stm_within_prompt', True) # Default to True if not in config
+        self.stm_condensation_strategy = co_config.get('stm_condensation_strategy', "truncate") # Default to "truncate"
+        self.target_stm_tokens_budget_ratio = co_config.get('target_stm_tokens_budget_ratio', 0.5) # Default to 0.5 (50%)
+        self.stm_summary_target_tokens = co_config.get('stm_summary_target_tokens', 200) # Default to 200
+        # --- End Loading New STM Management Settings ---
+
         fe_cfg = co_config.get('fact_extraction', {})
         self.fe_min_meaningful_length = fe_cfg.get('min_meaningful_length_for_filter', 3)
         self.fe_common_fillers = fe_cfg.get('common_fillers_for_filter', [])
-        self.fe_question_indicators_check = fe_cfg.get('question_indicators_for_filter', []) # Renamed to avoid clash
+        self.fe_question_indicators_check = fe_cfg.get('question_indicators_for_filter', [])
         
         self.active_conversation_id = None
         
@@ -77,7 +84,13 @@ class ConversationOrchestrator:
         print(f"  CO - Default LLM model for responses: {self.default_llm_model}")
         print(f"  CO - Target max prompt tokens: {self.target_max_prompt_tokens}")
         print(f"  CO - Min tokens for VS learn: {self.min_tokens_for_vs_learn}")
-
+        # --- Add print statements for new configs for verification ---
+        print(f"  CO - Manage STM in prompt: {self.manage_stm_within_prompt}")
+        print(f"  CO - STM Condensation Strategy: {self.stm_condensation_strategy}")
+        print(f"  CO - STM Token Budget Ratio: {self.target_stm_tokens_budget_ratio}")
+        print(f"  CO - STM Summary Target Tokens: {self.stm_summary_target_tokens}")
+        # --- End print statements ---
+        
     def _build_prompt_with_context(self,
                                    conversation_id: str, # No longer needed as param if self.active_conversation_id is used
                                    user_query: str,
