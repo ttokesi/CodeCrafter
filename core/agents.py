@@ -64,12 +64,12 @@ class KnowledgeRetrieverAgent:
 
             # --- STRATEGY 1: Targeted S-P-O Search (if provided) ---
             if skb_subject or skb_predicate or skb_object:
-                #print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
+                print(f"  KRA_DEBUG: Performing targeted SKB search: S='{skb_subject}', P='{skb_predicate}', O='{skb_object}'")
                 try:
                     targeted_facts = self.mmu.get_ltm_facts(
                         subject=skb_subject, predicate=skb_predicate, object_value=skb_object
                     )
-                    #print(f"  KRA_DEBUG: Targeted search found {len(targeted_facts)} fact(s).")
+                    print(f"  KRA_DEBUG: Targeted search found {len(targeted_facts)} fact(s).")
                     for fact in targeted_facts:
                         if 'fact_id' in fact: found_skb_facts_dict[fact['fact_id']] = fact
                 except Exception as e:
