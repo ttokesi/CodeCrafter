@@ -155,3 +155,105 @@ def test_count_tokens_hf_encode_fails(monkeypatch):
     
     count = tokenizer_utils.count_tokens_hf("Some text", hf_tokenizer_name="test-hf-model")
     assert count is None # Expect None if encoding fails
+
+def test_count_tokens_main_function_direct_map(monkeypatch):
+    """Test main count_tokens uses direct map from config."""
+    mock_config_data = {
+        "tokenizer": {
+            "hf_tokenizer_map": {
+                "ollama-model-exact:7b": "hf-exact-tokenizer-for-ollama-model" 
+            },
+            "default_hf_tokenizer": "hf-overall-default"
+        }
+    }
+    monkeypatch.setattr(tokenizer_utils, 'get_config', lambda: mock_config_data)
+
+    # Mock count_tokens_hf to see what hf_tokenizer_name it was called with
+    called_with_hf_tokenizer_name = None
+    def mock_ct_hf(text, hf_tokenizer_name=None):
+        nonlocal called_with_hf_tokenizer_name
+        called_with_hf_tokenizer_name = hf_tokenizer_name
+        return len(text.split()) # Simulate token count
+    monkeypatch.setattr(tokenizer_utils, 'count_tokens_hf', mock_ct_hf)
+    
+    tokenizer_utils.count_tokens("Test text", ollama_model_name="ollama-model-exact:7b")
+    assert called_with_hf_tokenizer_name == "hf-exact-tokenizer-for-ollama-model"
+
+def test_count_tokens_main_function_family_fallback(monkeypatch):
+    """Test main count_tokens uses family fallback from config."""
+    mock_config_data = {
+        "tokenizer": {
+            "hf_tokenizer_map": {
+                "default_gemma": "hf-gemma-family-default"
+            },
+            "default_hf_tokenizer": "hf-overall-default"
+        }
+    }
+    monkeypatch.setattr(tokenizer_utils, 'get_config', lambda: mock_config_data)
+    
+    called_with_hf_tokenizer_name = None
+    def mock_ct_hf(text, hf_tokenizer_name=None):
+        nonlocal called_with_hf_tokenizer_name
+        called_with_hf_tokenizer_name = hf_tokenizer_name
+        return 1 # Dummy count
+    monkeypatch.setattr(tokenizer_utils, 'count_tokens_hf', mock_ct_hf)
+
+    tokenizer_utils.count_tokens("Test text", ollama_model_name="gemma:some-variant")
+    assert called_with_hf_tokenizer_name == "hf-gemma-family-default"
+
+def test_count_tokens_main_function_overall_default(monkeypatch):
+    """Test main count_tokens uses overall default hf_tokenizer from config."""
+    mock_config_data = {
+        "tokenizer": {
+            "hf_tokenizer_map": {}, # Empty map
+            "default_hf_tokenizer": "hf-overall-default-for-this-test"
+        }
+    }
+    monkeypatch.setattr(tokenizer_utils, 'get_config', lambda: mock_config_data)
+
+    called_with_hf_tokenizer_name = None
+    def mock_ct_hf(text, hf_tokenizer_name=None):
+        nonlocal called_with_hf_tokenizer_name
+        called_with_hf_tokenizer_name = hf_tokenizer_name
+        return 1 # Dummy count
+    monkeypatch.setattr(tokenizer_utils, 'count_tokens_hf', mock_ct_hf)
+
+    tokenizer_utils.count_tokens("Test text", ollama_model_name="unknown-model:latest")
+    assert called_with_hf_tokenizer_name == "hf-overall-default-for-this-test"
+    
+def test_count_tokens_main_function_override(monkeypatch):
+    """Test main count_tokens uses hf_tokenizer_name_override."""
+    mock_config_data = {"tokenizer": {"hf_tokenizer_map": {}, "default_hf_tokenizer": "any"}}
+    monkeypatch.setattr(tokenizer_utils, 'get_config', lambda: mock_config_data)
+    
+    called_with_hf_tokenizer_name = None
+    def mock_ct_hf(text, hf_tokenizer_name=None):
+        nonlocal called_with_hf_tokenizer_name
+        called_with_hf_tokenizer_name = hf_tokenizer_name
+        return 1
+    monkeypatch.setattr(tokenizer_utils, 'count_tokens_hf', mock_ct_hf)
+
+    tokenizer_utils.count_tokens(
+        "Test text", 
+        ollama_model_name="any-ollama-model",
+        hf_tokenizer_name_override="explicit-override-tokenizer"
+    )
+    assert called_with_hf_tokenizer_name == "explicit-override-tokenizer"
+
+def test_count_tokens_main_function_hf_fails_fallback_to_word_count(monkeypatch):
+    """Test main count_tokens falls back to word count if count_tokens_hf fails."""
+    mock_config_data = {"tokenizer": {"default_hf_tokenizer": "any"}} # Minimal config
+    monkeypatch.setattr(tokenizer_utils, 'get_config', lambda: mock_config_data)
+    
+    # Mock count_tokens_hf to return None (simulating failure)
+    monkeypatch.setattr(tokenizer_utils, 'count_tokens_hf', lambda text, hf_tokenizer_name=None: None)
+    
+    text_to_test = "This is a test sentence." # 6 words
+    count = tokenizer_utils.count_tokens(text_to_test, ollama_model_name="any-model")
+    assert count == 5
+
+def test_count_tokens_main_function_empty_text():
+    """Test main count_tokens with empty text returns 0."""
+    # No mocking needed, should short-circuit
+    count = tokenizer_utils.count_tokens("", ollama_model_name="any-model")
+    assert count == 0
