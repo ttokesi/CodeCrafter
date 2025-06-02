@@ -223,3 +223,87 @@ def test_mtm_get_recent_summaries_sorted(mtm_instance, monkeypatch):
         assert recent_one[0]["summary_id"] == "s1"
     else:
         assert recent_one[0]["metadata"]["id_check"] == "s1"
+
+def test_mtm_store_and_get_entity(mtm_instance):
+    """Test storing and retrieving an entity."""
+    category = "user_details"
+    entity_key = "username"
+    entity_value = "test_user_123"
+
+    mtm_instance.store_entity(category, entity_key, entity_value)
+    retrieved_value = mtm_instance.get_entity(category, entity_key)
+    
+    assert retrieved_value == entity_value
+
+def test_mtm_get_non_existent_entity(mtm_instance):
+    """Test retrieving a non-existent entity returns None."""
+    assert mtm_instance.get_entity("user_details", "non_existent_key") is None
+    assert mtm_instance.get_entity("non_existent_category", "any_key") is None
+
+def test_mtm_get_entities_by_category(mtm_instance):
+    """Test retrieving all entities for a given category."""
+    category = "project_settings"
+    mtm_instance.store_entity(category, "id", "alpha")
+    mtm_instance.store_entity(category, "status", "active")
+    # Store an entity in a different category to ensure it's not retrieved
+    mtm_instance.store_entity("other_category", "noise", "ignore_me")
+    
+    entities = mtm_instance.get_entities_by_category(category)
+    
+    assert entities is not None
+    assert len(entities) == 2
+    assert entities["id"] == "alpha"
+    assert entities["status"] == "active"
+
+def test_mtm_get_entities_for_non_existent_category(mtm_instance):
+    """Test retrieving entities for a non-existent category returns None."""
+    assert mtm_instance.get_entities_by_category("no_such_category") is None
+
+def test_mtm_store_entity_updates_existing(mtm_instance):
+    """Test storing an entity with an existing category and key updates it."""
+    category = "user_prefs"
+    entity_key = "theme"
+    mtm_instance.store_entity(category, entity_key, "dark")
+    retrieved_old = mtm_instance.get_entity(category, entity_key)
+    assert retrieved_old == "dark"
+    
+    mtm_instance.store_entity(category, entity_key, "light") # Update
+    retrieved_new = mtm_instance.get_entity(category, entity_key)
+    assert retrieved_new == "light"
+
+def test_mtm_store_and_get_task_context(mtm_instance):
+    """Test storing and retrieving task-specific context data."""
+    context_key = "current_operation_state"
+    data_value = {"step": 5, "details": "processing payment"}
+    
+    mtm_instance.store_task_context(context_key, data_value)
+    retrieved_data = mtm_instance.get_task_context(context_key)
+    
+    assert retrieved_data == data_value
+
+def test_mtm_get_non_existent_task_context(mtm_instance):
+    """Test retrieving non-existent task context returns None."""
+    assert mtm_instance.get_task_context("no_such_context_key") is None
+    
+def test_mtm_store_task_context_updates_existing(mtm_instance):
+    """Test storing task context with an existing key updates it."""
+    context_key = "active_job_id"
+    mtm_instance.store_task_context(context_key, "job_123")
+    
+    mtm_instance.store_task_context(context_key, "job_456") # Update
+    retrieved_new = mtm_instance.get_task_context(context_key)
+    assert retrieved_new == "job_456"
+
+def test_mtm_clear_session_data_entities_and_context(mtm_instance):
+    """Test clear_session_data also clears entities and task context."""
+    mtm_instance.store_entity("cat1", "key1", "val1")
+    mtm_instance.store_task_context("ctx1", "data1")
+    
+    assert mtm_instance.get_entity("cat1", "key1") == "val1"
+    assert mtm_instance.get_task_context("ctx1") == "data1"
+    
+    mtm_instance.clear_session_data()
+    
+    assert mtm_instance.get_entity("cat1", "key1") is None
+    assert mtm_instance.get_entities_by_category("cat1") is None
+    assert mtm_instance.get_task_context("ctx1") is None
