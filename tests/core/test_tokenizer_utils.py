@@ -114,3 +114,44 @@ def test_get_hf_tokenizer_lib_not_available(monkeypatch):
     
     tokenizer = tokenizer_utils.get_hf_tokenizer("some-tokenizer")
     assert tokenizer is None
+
+def test_count_tokens_hf_success(monkeypatch):
+    """Test count_tokens_hf successfully counts tokens using a mock tokenizer."""
+    
+    # Mock get_hf_tokenizer to return a controllable MockHFTokenizer instance
+    mock_tokenizer_instance = MockHFTokenizer("test-hf-model")
+    # We want to control the output of encode().ids for this test
+    mock_tokenizer_instance.mock_encoded_ids = [1, 2, 3, 4, 5] # Simulate 5 tokens
+    
+    monkeypatch.setattr(tokenizer_utils, 'get_hf_tokenizer', lambda name=None: mock_tokenizer_instance)
+    
+    count = tokenizer_utils.count_tokens_hf("Some example text", hf_tokenizer_name="test-hf-model")
+    assert count == 5
+    assert mock_tokenizer_instance.encode_call_count == 1 # Ensure encode was called
+
+def test_count_tokens_hf_empty_text(monkeypatch):
+    """Test count_tokens_hf with empty text."""
+    # No need to mock get_hf_tokenizer for this, as it should return 0 before even trying to get a tokenizer
+    count = tokenizer_utils.count_tokens_hf("", hf_tokenizer_name="any-model")
+    assert count == 0
+
+def test_count_tokens_hf_get_tokenizer_fails(monkeypatch):
+    """Test count_tokens_hf when get_hf_tokenizer returns None."""
+    monkeypatch.setattr(tokenizer_utils, 'get_hf_tokenizer', lambda name=None: None)
+    
+    count = tokenizer_utils.count_tokens_hf("Some text", hf_tokenizer_name="fail-model")
+    assert count is None
+
+def test_count_tokens_hf_encode_fails(monkeypatch):
+    """Test count_tokens_hf when tokenizer.encode() raises an error."""
+    
+    mock_tokenizer_instance = MockHFTokenizer("test-hf-model")
+    # Make the encode method raise an error
+    def mock_encode_raises_error(text):
+        raise ValueError("Simulated encoding error")
+    mock_tokenizer_instance.encode = mock_encode_raises_error
+        
+    monkeypatch.setattr(tokenizer_utils, 'get_hf_tokenizer', lambda name=None: mock_tokenizer_instance)
+    
+    count = tokenizer_utils.count_tokens_hf("Some text", hf_tokenizer_name="test-hf-model")
+    assert count is None # Expect None if encoding fails
