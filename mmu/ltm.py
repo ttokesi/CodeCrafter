@@ -2,7 +2,7 @@
 
 import sqlite3
 import uuid  # For generating unique IDs
-import datetime # For timestamps
+from datetime import datetime, timezone # Ensure timezone is imported here
 import json # For storing metadata as JSON strings
 import os # For path joining
 import chromadb
@@ -20,9 +20,9 @@ class RawConversationLog:
         if self.db_path == ":memory:":
             # For in-memory, create and hold the connection.
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            print(f"DEBUG: RawConversationLog (:memory:) created persistent connection: {self._conn}")
-        else:
-            print(f"DEBUG: RawConversationLog (file: {self.db_path}) will use per-operation connections.")
+            #print(f"DEBUG: RawConversationLog (:memory:) created persistent connection: {self._conn}")
+        #else:
+            #print(f"DEBUG: RawConversationLog (file: {self.db_path}) will use per-operation connections.")
         self._create_table()
 
     def _get_connection(self):
@@ -62,10 +62,10 @@ class RawConversationLog:
                     ON conversation_log (timestamp)
                 ''')
                 conn.commit()
-                print(f"DEBUG (_create_table): Table creation/check successful for {self.db_path}") # Temporary debug
+                #print(f"DEBUG (_create_table): Table creation/check successful for {self.db_path}") # Temporary debug
         except sqlite3.Error as e:
             # This print is important. If it appears, table creation failed.
-            print(f"CRITICAL SQLITE ERROR in _create_table for {self.db_path}: {e}") 
+            #print(f"CRITICAL SQLITE ERROR in _create_table for {self.db_path}: {e}") 
             raise # Re-raise the exception to make the test fail clearly if table creation fails
 
     def log_interaction(self,
@@ -94,7 +94,7 @@ class RawConversationLog:
             str: The unique entry_id for this log entry, or None if logging failed.
         """
         entry_id = str(uuid.uuid4())
-        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         
         # Convert metadata dict to a JSON string for storage
         metadata_json = json.dumps(metadata) if metadata else None
@@ -196,7 +196,7 @@ class RawConversationLog:
     def close(self): # Add a close method
         """Closes the persistent connection if one is held (for :memory: databases)."""
         if self._conn:
-            print(f"DEBUG: Closing RawConversationLog persistent connection for {self.db_path}")
+            #print(f"DEBUG: Closing RawConversationLog persistent connection for {self.db_path}")
             self._conn.close()
             self._conn = None
 
@@ -204,21 +204,32 @@ class StructuredKnowledgeBase:
     """
     Manages structured knowledge (facts, preferences, entities) in SQLite.
     """
-    def __init__(self, db_path: str): # db_path is now required, no default
+    def __init__(self, db_path: str):
+        if not isinstance(db_path, str) or not db_path:
+            raise ValueError("StructuredKnowledgeBase requires a valid db_path string.")
         self.db_path = db_path
+        self._conn = None # Attribute to hold the connection if :memory:
+        
+        if self.db_path == ":memory:":
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            #print(f"DEBUG: SKB (:memory:) created persistent connection: {self._conn}") # Optional
+        #else:
+            #print(f"DEBUG: SKB (file: {self.db_path}) will use per-operation connections.") # Optional
+            
         self._create_tables()
 
     def _get_connection(self):
         """Helper method to get a database connection."""
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        if self._conn: # If we have a persistent connection (for :memory:)
+            return self._conn
+        else: # For file-based DBs, create a new connection each time
+            return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _create_tables(self):
         """
         Creates tables for structured knowledge if they don't exist.
-        - 'facts': For storing subject-predicate-object style facts.
-        - 'user_preferences': For storing user-specific preferences.
-        - 'entities': For storing general entities and their attributes.
         """
+        #print(f"DEBUG (SKB _create_tables): Attempting for {self.db_path}") # Optional debug
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -228,19 +239,19 @@ class StructuredKnowledgeBase:
                         fact_id TEXT PRIMARY KEY,
                         subject TEXT NOT NULL,
                         predicate TEXT NOT NULL,
-                        object TEXT NOT NULL,
-                        source_turn_ids TEXT, -- JSON list of entry_ids from conversation_log
+                        object TEXT NOT NULL, -- Changed from object_value to object to match Design Doc & common use
+                        source_turn_ids TEXT, 
                         created_at TEXT NOT NULL,
                         last_accessed TEXT,
-                        confidence REAL, -- e.g., 0.0 to 1.0
-                        UNIQUE (subject, predicate, object) -- Basic uniqueness for a fact
+                        confidence REAL, 
+                        UNIQUE (subject, predicate, object) 
                     )
                 ''')
                 # User Preferences table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS user_preferences (
                         preference_id TEXT PRIMARY KEY,
-                        user_id TEXT DEFAULT 'default_user', -- Can be extended for multi-user
+                        user_id TEXT DEFAULT 'default_user', 
                         category TEXT NOT NULL,
                         key TEXT NOT NULL,
                         value TEXT NOT NULL,
@@ -252,71 +263,73 @@ class StructuredKnowledgeBase:
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS entities (
                         entity_id TEXT PRIMARY KEY,
-                        entity_text TEXT NOT NULL UNIQUE, -- The canonical text of the entity
-                        entity_type TEXT, -- e.g., "PERSON", "LOCATION", "PROJECT"
-                        attributes TEXT, -- JSON string for additional attributes
+                        entity_text TEXT NOT NULL UNIQUE, 
+                        entity_type TEXT, 
+                        attributes TEXT, 
                         created_at TEXT NOT NULL
                     )
                 ''')
-                conn.commit()
+                conn.commit() # Not strictly needed with 'with conn:', but ensures it for all cases
+                #print(f"DEBUG (SKB _create_tables): Successful for {self.db_path}") # Optional debug
         except sqlite3.Error as e:
-            print(f"SQLite error during SKB table creation: {e}")
+            print(f"CRITICAL SQLITE ERROR in SKB _create_tables for {self.db_path}: {e}")
+            raise
 
-    def store_fact(self, subject: str, predicate: str, object_value: str,
+    def store_fact(self, subject: str, predicate: str, object_value: str, # Param name object_value
                    source_turn_ids: list = None, confidence: float = 1.0) -> str:
-        """Stores a fact (subject-predicate-object)."""
         fact_id = str(uuid.uuid4())
-        created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        created_at = datetime.now(timezone.utc).isoformat()
         source_ids_json = json.dumps(source_turn_ids) if source_turn_ids else None
 
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
+                # SQL uses 'object' column, method param is 'object_value'
+                cursor.execute(''' 
                     INSERT INTO facts (fact_id, subject, predicate, object, source_turn_ids, created_at, confidence)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(subject, predicate, object) DO UPDATE SET
-                        source_turn_ids = excluded.source_turn_ids, -- Or append logic
-                        last_accessed = datetime('now', 'utc'),
-                        confidence = excluded.confidence -- Or update based on new evidence
+                        source_turn_ids = excluded.source_turn_ids, 
+                        last_accessed = datetime('now', 'utc'), 
+                        confidence = excluded.confidence 
                 ''', (fact_id, subject, predicate, object_value, source_ids_json, created_at, confidence))
-                conn.commit()
-                # If ON CONFLICT happened, we might want the existing fact_id.
-                # For simplicity, we return the new one or the one that would have been inserted.
-                # A more robust way would be to SELECT after INSERT/UPDATE.
-                if cursor.lastrowid == 0: # No insert happened due to conflict (for some drivers)
-                    # Try to fetch the existing one
+                # conn.commit() is handled by 'with conn:' for file DBs
+                if self.db_path == ":memory:" and self._conn: # Explicit commit for persistent :memory:
+                    self._conn.commit()
+                
+                # Determine the ID that was actually used (new or existing due to conflict)
+                # This logic might need adjustment if fact_id is not the one kept on conflict.
+                # A robust way is to SELECT after the operation.
+                if cursor.lastrowid == 0: 
                     cursor.execute("SELECT fact_id FROM facts WHERE subject=? AND predicate=? AND object=?",
                                    (subject, predicate, object_value))
                     row = cursor.fetchone()
                     if row: return row[0]
-                return fact_id
+                return fact_id # Return initially generated fact_id or the one from SELECT
         except sqlite3.Error as e:
             print(f"SQLite error during store_fact: {e}")
             return None
 
-    def get_facts(self, subject: str = None, predicate: str = None, object_value: str = None) -> list:
-        """Retrieves facts matching the given criteria."""
+    def get_facts(self, subject: str = None, predicate: str = None, object_value: str = None) -> list: # Param name object_value
         try:
             with self._get_connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
-                query = "SELECT * FROM facts WHERE 1=1" # Start with a true condition
+                query = "SELECT * FROM facts WHERE 1=1" 
                 params = []
                 if subject:
-                    query += " AND subject LIKE ?" # Using LIKE for flexibility
+                    query += " AND subject LIKE ?" 
                     params.append(f"%{subject}%")
                 if predicate:
                     query += " AND predicate LIKE ?"
                     params.append(f"%{predicate}%")
-                if object_value:
-                    query += " AND object LIKE ?"
+                if object_value: # Query against 'object' column in DB
+                    query += " AND object LIKE ?" 
                     params.append(f"%{object_value}%")
                 
                 cursor.execute(query, tuple(params))
                 rows = cursor.fetchall()
-                # Convert to list of dicts, parsing source_turn_ids
                 facts_list = []
                 for row in rows:
                     row_dict = dict(row)
@@ -325,17 +338,17 @@ class StructuredKnowledgeBase:
                             row_dict['source_turn_ids'] = json.loads(row_dict['source_turn_ids'])
                         except json.JSONDecodeError:
                              print(f"Warning: Could not decode source_turn_ids for fact_id {row_dict.get('fact_id')}")
-                             pass
+                             pass # Keep as string if decode fails
                     facts_list.append(row_dict)
                 return facts_list
         except sqlite3.Error as e:
             print(f"SQLite error during get_facts: {e}")
             return []
 
+    # --- Methods for user_preferences (ensure they also use 'with self._get_connection()') ---
     def store_preference(self, category: str, key: str, value: str, user_id: str = "default_user") -> str:
-        """Stores a user preference."""
         preference_id = str(uuid.uuid4())
-        created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        created_at = datetime.now(timezone.utc).isoformat()
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -344,10 +357,12 @@ class StructuredKnowledgeBase:
                     VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, category, key) DO UPDATE SET
                         value = excluded.value,
-                        created_at = excluded.created_at -- Or keep original created_at
+                        created_at = excluded.created_at 
                 ''', (preference_id, user_id, category, key, value, created_at))
-                conn.commit()
-                if cursor.lastrowid == 0:
+                if self.db_path == ":memory:" and self._conn:
+                    self._conn.commit()
+                
+                if cursor.lastrowid == 0: # Check if conflict occurred
                      cursor.execute("SELECT preference_id FROM user_preferences WHERE user_id=? AND category=? AND key=?",
                                    (user_id, category, key))
                      row = cursor.fetchone()
@@ -358,7 +373,6 @@ class StructuredKnowledgeBase:
             return None
 
     def get_preference(self, category: str, key: str, user_id: str = "default_user") -> dict:
-        """Retrieves a specific user preference."""
         try:
             with self._get_connection() as conn:
                 conn.row_factory = sqlite3.Row
@@ -372,6 +386,13 @@ class StructuredKnowledgeBase:
         except sqlite3.Error as e:
             print(f"SQLite error during get_preference: {e}")
             return None
+
+    def close(self): # Add a close method
+        """Closes the persistent connection if one is held (for :memory: databases)."""
+        if self._conn:
+            #print(f"DEBUG: Closing SKB persistent :memory: connection.") # Optional
+            self._conn.close()
+            self._conn = None
 
     # We can add methods for entities (store_entity, get_entity) similarly later if needed.
 
