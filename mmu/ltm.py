@@ -11,37 +11,32 @@ import time # <--- ADD THIS IMPORT
 import gc
 
 class RawConversationLog:
-    """
-    Manages the raw conversation log stored in an SQLite database.
-    Stores every interaction turn by turn.
-    """
-    def __init__(self, db_path: str): # db_path is now required, no default
+    # ... (init as confirmed, with self._conn for :memory:) ...
+    def __init__(self, db_path: str):
+        if not isinstance(db_path, str) or not db_path:
+            raise ValueError("RawConversationLog requires a valid db_path string.")
         self.db_path = db_path
-        self._create_table()
-        """
-        Initializes the RawConversationLog.
-        Connects to the SQLite database and creates the necessary table if it doesn't exist.
-
-        Args:
-            db_path (str): The path to the SQLite database file.
-        """
-        self.db_path = db_path
+        self._conn = None 
+        if self.db_path == ":memory:":
+            # For in-memory, create and hold the connection.
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            print(f"DEBUG: RawConversationLog (:memory:) created persistent connection: {self._conn}")
+        else:
+            print(f"DEBUG: RawConversationLog (file: {self.db_path}) will use per-operation connections.")
         self._create_table()
 
     def _get_connection(self):
-        """Helper method to get a database connection."""
-        # `check_same_thread=False` is used here for simplicity.
-        # For more complex applications, especially with multi-threading,
-        # you might need a more robust connection management strategy.
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        if self._conn: # If we have a persistent connection (for :memory:)
+            return self._conn
+        else: # For file-based DBs, create a new connection each time
+            return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _create_table(self):
-        """
-        Creates the 'conversation_log' table if it doesn't already exist.
-        This table will store individual turns of a conversation.
-        """
+        # print(f"DEBUG (_create_table): Attempting to create table in {self.db_path}")
         try:
-            with self._get_connection() as conn:
+            # Use 'with' for transaction management. 
+            # If self._conn exists, it's used. If not, a new one is made and closed by 'with'.
+            with self._get_connection() as conn: 
                 cursor = conn.cursor()
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS conversation_log (
@@ -58,7 +53,6 @@ class RawConversationLog:
                         UNIQUE (conversation_id, turn_sequence_id)
                     )
                 ''')
-                # Creating indexes for faster queries
                 cursor.execute('''
                     CREATE INDEX IF NOT EXISTS idx_conversation_id 
                     ON conversation_log (conversation_id)
@@ -68,9 +62,11 @@ class RawConversationLog:
                     ON conversation_log (timestamp)
                 ''')
                 conn.commit()
+                print(f"DEBUG (_create_table): Table creation/check successful for {self.db_path}") # Temporary debug
         except sqlite3.Error as e:
-            print(f"SQLite error during table creation for conversation_log: {e}")
-            # In a real app, you might want to raise the exception or handle it more gracefully
+            # This print is important. If it appears, table creation failed.
+            print(f"CRITICAL SQLITE ERROR in _create_table for {self.db_path}: {e}") 
+            raise # Re-raise the exception to make the test fail clearly if table creation fails
 
     def log_interaction(self,
                         conversation_id: str,
@@ -196,6 +192,13 @@ class RawConversationLog:
         except sqlite3.Error as e:
             print(f"SQLite error during get_all_conversation_ids: {e}")
             return []
+    
+    def close(self): # Add a close method
+        """Closes the persistent connection if one is held (for :memory: databases)."""
+        if self._conn:
+            print(f"DEBUG: Closing RawConversationLog persistent connection for {self.db_path}")
+            self._conn.close()
+            self._conn = None
 
 class StructuredKnowledgeBase:
     """
