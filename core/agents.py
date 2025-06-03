@@ -130,8 +130,8 @@ class KnowledgeRetrieverAgent:
                 # Example: "Where is X?" -> search subject "X", predicate "location is" OR "is located in"
 
             # --- STRATEGY 3: General Keyword-Based Search (if previous strategies found little or as a fallback) ---
-            # Run this if pattern search found nothing or to augment it.
-            if query_text: # and not found_skb_facts_dict: # Optional: only run if patterns failed
+            # Run this if query_text is available AND no facts have been found by targeted or pattern search yet.
+            if query_text and not found_skb_facts_dict: 
                 stop_words = ["what", "is", "my", "me", "i", "do", "you", "the", "a", "and", "tell", "about", "can", "does", "was", "are", "were", "of", "for", "on", "in", "at", "it"]
                 punctuation_to_strip = str.maketrans('', '', '.,?!;:"()[]{}')
                 raw_keywords = query_text.lower().split()
