@@ -75,32 +75,48 @@ def mock_mmu(mocker): # Add mocker fixture
     return mmu_mock
 
 # Placeholder for future mock LSW
-class MockLLMServiceWrapper:
-    def __init__(self, config=None): # Add config to match real LSW
-        self.config = config or {} # Store it if needed
-        self.default_chat_model = self.config.get('lsw', {}).get('default_chat_model', 'mock_default_lsw_chat_model')
-        print(f"MockLLMServiceWrapper initialized. Default chat model: {self.default_chat_model}")
-        # Attributes for generate_chat_completion
-        self.gcc_called_with = None
-        self.mock_gcc_response = "Default mock LLM response."
-        self.gcc_should_raise_error = None
+# class MockLLMServiceWrapper:
+#     def __init__(self, config=None): # Add config to match real LSW
+#         self.config = config or {} # Store it if needed
+#         self.default_chat_model = self.config.get('lsw', {}).get('default_chat_model', 'mock_default_lsw_chat_model')
+#         print(f"MockLLMServiceWrapper initialized. Default chat model: {self.default_chat_model}")
+#         # Attributes for generate_chat_completion
+#         self.gcc_called_with = None
+#         self.mock_gcc_response = "Default mock LLM response."
+#         self.gcc_should_raise_error = None
 
-    def generate_chat_completion(self, messages: list, model_name: str = None, **kwargs):
-        print(f"MockLSW.generate_chat_completion called with model: '{model_name or self.default_chat_model}', messages_count: {len(messages)}")
-        self.gcc_called_with = {"messages": messages, "model_name": model_name or self.default_chat_model, "kwargs": kwargs}
-        if self.gcc_should_raise_error:
-            raise self.gcc_should_raise_error
-        return self.mock_gcc_response
+#     def generate_chat_completion(self, messages: list, model_name: str = None, **kwargs):
+#         print(f"MockLSW.generate_chat_completion called with model: '{model_name or self.default_chat_model}', messages_count: {len(messages)}")
+#         self.gcc_called_with = {"messages": messages, "model_name": model_name or self.default_chat_model, "kwargs": kwargs}
+#         if self.gcc_should_raise_error:
+#             raise self.gcc_should_raise_error
+#         return self.mock_gcc_response
     
-    # Add other LSW methods as needed for agent tests (e.g., generate_embedding if an agent uses it)
+#     # Add other LSW methods as needed for agent tests (e.g., generate_embedding if an agent uses it)
 
 @pytest.fixture
-def mock_lsw(isolated_agent_config): # Depends on isolated_agent_config
-    """Provides a fresh instance of MockLLMServiceWrapper, configured."""
-    # Pass the 'lsw' part of the isolated_agent_config to MockLSW
-    # to simulate LSW loading its specific configuration.
-    lsw_specific_config = {"lsw": isolated_agent_config.get('lsw', {})}
-    return MockLLMServiceWrapper(config=lsw_specific_config)
+def mock_lsw(mocker, isolated_agent_config): # Add mocker, use isolated_agent_config
+    """
+    Provides a mock LLMServiceWrapper object that passes isinstance checks
+    and allows setting return values for its methods. Configured via isolated_agent_config.
+    """
+    # Create a mock object with the spec of the real LLMServiceWrapper
+    lsw_mock = mocker.create_autospec(LLMServiceWrapper, instance=True)
+    
+    # Configure the mock instance based on isolated_agent_config
+    # The real LSW.__init__ takes an optional config. Our autospec mock won't run that
+    # __init__ by default, but we need to set attributes that SummarizationAgent might read.
+    # SummarizationAgent reads `lsw.default_chat_model`.
+    
+    lsw_config_for_mock = isolated_agent_config.get('lsw', {})
+    lsw_mock.default_chat_model = lsw_config_for_mock.get('default_chat_model', 'autospec_lsw_default_chat_model')
+    
+    # Set default return values for methods that might be called by agents
+    lsw_mock.generate_chat_completion.return_value = "Default autospec LSW response."
+    # Add other methods like generate_embedding if other agents use them
+    
+    print(f"mock_lsw fixture: Created autospecced LLMServiceWrapper. Default chat model: {lsw_mock.default_chat_model}")
+    return lsw_mock
 
 
 # Autouse fixture to ensure config_loader is reset for agent tests
@@ -311,3 +327,152 @@ def test_kra_search_knowledge_both_sources_with_results(mock_mmu):
             
     assert pattern_call_found, \
         f"get_ltm_facts was not called for any of the expected '{entity_for_pattern}' pattern subjects. Expected one of: {expected_subjects_for_pattern_call_check}. Calls: {mock_mmu.get_ltm_facts.call_args_list}"
+    
+def test_sa_init_success_with_lsw_and_default_model(mock_lsw, isolated_agent_config): # SA for SummarizationAgent
+    """
+    Tests successful initialization of SummarizationAgent, relying on LSW's default model
+    as specified in the (mocked) agent config for LSW.
+    """
+    # mock_lsw fixture provides an instance of MockLLMServiceWrapper.
+    # isolated_agent_config fixture ensures MockLSW is initialized with test config.
+    
+    # The mock_lsw fixture initializes MockLLMServiceWrapper with a config.
+    # MockLLMServiceWrapper's __init__ sets self.default_chat_model based on this.
+    # The expected_lsw_default_chat_model comes from default_mock_agent_related_config in isolated_agent_config
+    expected_lsw_default_chat_model = isolated_agent_config['lsw']['default_chat_model']
+
+    try:
+        sa = SummarizationAgent(lsw=mock_lsw) # No explicit default_model_name for agent
+        assert sa.lsw is mock_lsw, "SA should store the provided LSW instance."
+        # Agent's default_model_name should fallback to LSW's default_chat_model
+        assert sa.default_model_name == expected_lsw_default_chat_model, \
+            f"SA default model should be LSW's default ({expected_lsw_default_chat_model}), but got {sa.default_model_name}"
+    except Exception as e:
+        pytest.fail(f"SummarizationAgent initialization failed unexpectedly: {e}")
+
+def test_sa_init_success_with_explicit_default_model(mock_lsw):
+    """
+    Tests successful initialization of SummarizationAgent with an explicitly provided
+    default_model_name for the agent itself.
+    """
+    explicit_agent_model = "agent-specific-summarizer-model:v1"
+    try:
+        sa = SummarizationAgent(lsw=mock_lsw, default_model_name=explicit_agent_model)
+        assert sa.lsw is mock_lsw
+        assert sa.default_model_name == explicit_agent_model, \
+            "SA default model should be the explicitly passed one."
+    except Exception as e:
+        pytest.fail(f"SummarizationAgent initialization failed unexpectedly: {e}")
+
+def test_sa_init_type_error_for_invalid_lsw(mock_mmu): # Using mock_mmu as an invalid type
+    """
+    Tests that SummarizationAgent raises a TypeError if not initialized
+    with an LLMServiceWrapper instance.
+    """
+    # SummarizationAgent's __init__ has a type check:
+    # if not isinstance(lsw, LLMServiceWrapper):
+    #     raise TypeError("SummarizationAgent requires an instance of LLMServiceWrapper.")
+    
+    with pytest.raises(TypeError) as excinfo:
+        SummarizationAgent(lsw=mock_mmu) # Pass an incorrect type (MockMMU)
+    
+    assert "SummarizationAgent requires an instance of LLMServiceWrapper" in str(excinfo.value)
+
+def test_sa_summarize_text_success_default_prompt_and_model(mock_lsw, isolated_agent_config):
+    agent_default_summarizer_model = isolated_agent_config['agents']['summarization_agent_model']
+    sa = SummarizationAgent(lsw=mock_lsw, default_model_name=agent_default_summarizer_model)
+    
+    text_to_summarize = "This is a long piece of text that needs to be summarized efficiently by the great agent."
+    expected_summary = "Concise summary of the text."
+    # --- CORRECTED LINE ---
+    mock_lsw.generate_chat_completion.return_value = expected_summary
+
+    summary = sa.summarize_text(text_to_summarize=text_to_summarize)
+
+    assert summary == expected_summary.strip()
+    
+    # Verify LSW call (using .actual_method_name from autospec)
+    # For autospec, the call arguments are stored on the mock method itself.
+    # The 'gcc_called_with' attribute was for our manual MockLLMServiceWrapper class.
+    # MagicMock (from autospec) provides .called, .call_count, .call_args, .call_args_list
+    
+    assert mock_lsw.generate_chat_completion.called, "LSW generate_chat_completion was not called."
+    assert mock_lsw.generate_chat_completion.call_count == 1
+    
+    call_args_kwargs = mock_lsw.generate_chat_completion.call_args.kwargs
+    # print(f"DEBUG - LSW call_args_kwargs: {call_args_kwargs}") # For debugging
+
+    assert call_args_kwargs.get("model_name") == agent_default_summarizer_model
+    assert len(call_args_kwargs.get("messages", [])) == 2
+    assert call_args_kwargs["messages"][0]["role"] == "system"
+    assert "summarize" in call_args_kwargs["messages"][1]["content"].lower()
+    assert text_to_summarize in call_args_kwargs["messages"][1]["content"]
+    assert call_args_kwargs.get("temperature") == 0.2
+    assert call_args_kwargs.get("max_tokens") == 150
+
+def test_sa_summarize_text_explicit_model_params_and_custom_prompt(mock_lsw):
+    sa = SummarizationAgent(lsw=mock_lsw)
+
+    text_to_summarize = "Some other text."
+    custom_model = "custom-summarizer-model:latest"
+    custom_max_len = 50
+    custom_temp = 0.5
+    custom_prompt = "My custom prompt for: {text_to_summarize}. Be very brief."
+    expected_summary_via_custom = "Brief summary."
+    # --- CORRECTED LINE ---
+    mock_lsw.generate_chat_completion.return_value = expected_summary_via_custom
+
+    summary = sa.summarize_text(
+        text_to_summarize=text_to_summarize,
+        model_name=custom_model,
+        max_summary_length=custom_max_len,
+        temperature=custom_temp,
+        custom_prompt_template=custom_prompt
+    )
+
+    assert summary == expected_summary_via_custom.strip()
+    
+    call_args_kwargs = mock_lsw.generate_chat_completion.call_args.kwargs
+    assert call_args_kwargs.get("model_name") == custom_model
+    assert custom_prompt.format(text_to_summarize=text_to_summarize) == call_args_kwargs["messages"][1]["content"]
+    assert call_args_kwargs.get("temperature") == custom_temp
+    assert call_args_kwargs.get("max_tokens") == custom_max_len
+
+def test_sa_summarize_text_lsw_returns_none(mock_lsw):
+    sa = SummarizationAgent(lsw=mock_lsw)
+    # --- CORRECTED LINE ---
+    mock_lsw.generate_chat_completion.return_value = None # Simulate LSW failure
+
+    summary = sa.summarize_text("Some valid text.")
+    assert summary is None
+
+# test_sa_summarize_text_empty_input and test_sa_summarize_text_custom_prompt_missing_placeholder
+# need to check that LSW was NOT called.
+# We can reset the mock's call status or check call_count.
+
+def test_sa_summarize_text_empty_input(mock_lsw): # Already passing, but let's refine assertion
+    sa = SummarizationAgent(lsw=mock_lsw)
+    
+    # Reset call count before this specific action
+    mock_lsw.generate_chat_completion.reset_mock() 
+
+    summary_empty = sa.summarize_text("")
+    summary_whitespace = sa.summarize_text("   \n   ")
+
+    assert summary_empty is None
+    assert summary_whitespace is None
+    # Assert LSW was not called
+    mock_lsw.generate_chat_completion.assert_not_called()
+    
+def test_sa_summarize_text_custom_prompt_missing_placeholder(mock_lsw, capsys): # Already passing, refine assertion
+    sa = SummarizationAgent(lsw=mock_lsw)
+    bad_custom_prompt = "Summarize this please."
+    
+    mock_lsw.generate_chat_completion.reset_mock()
+
+    summary = sa.summarize_text("Some text.", custom_prompt_template=bad_custom_prompt)
+    
+    assert summary is None
+    captured = capsys.readouterr()
+    assert "Custom prompt template must include '{text_to_summarize}'" in captured.out
+    mock_lsw.generate_chat_completion.assert_not_called()
