@@ -3,6 +3,7 @@
 import pytest
 import os
 import sys
+import json
 
 # --- Path Adjustment ---
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -476,3 +477,166 @@ def test_sa_summarize_text_custom_prompt_missing_placeholder(mock_lsw, capsys): 
     captured = capsys.readouterr()
     assert "Custom prompt template must include '{text_to_summarize}'" in captured.out
     mock_lsw.generate_chat_completion.assert_not_called()
+
+def test_fea_init_success_with_lsw_and_default_model(mock_lsw, isolated_agent_config): # FEA for FactExtractionAgent
+    """
+    Tests successful initialization of FactExtractionAgent, relying on LSW's default model.
+    """
+    expected_lsw_default_chat_model = isolated_agent_config['lsw']['default_chat_model']
+
+    try:
+        fea = FactExtractionAgent(lsw=mock_lsw) # No explicit default_model_name for agent
+        assert fea.lsw is mock_lsw, "FEA should store the provided LSW instance."
+        # Agent's default_model_name should fallback to LSW's default_chat_model
+        assert fea.default_model_name == expected_lsw_default_chat_model, \
+            f"FEA default model should be LSW's default ({expected_lsw_default_chat_model}), but got {fea.default_model_name}"
+    except Exception as e:
+        pytest.fail(f"FactExtractionAgent initialization failed unexpectedly: {e}")
+
+def test_fea_init_success_with_explicit_default_model(mock_lsw):
+    """
+    Tests successful initialization of FactExtractionAgent with an explicitly provided
+    default_model_name for the agent itself.
+    """
+    explicit_agent_model = "agent-specific-extractor-model:v1"
+    try:
+        fea = FactExtractionAgent(lsw=mock_lsw, default_model_name=explicit_agent_model)
+        assert fea.lsw is mock_lsw
+        assert fea.default_model_name == explicit_agent_model, \
+            "FEA default model should be the explicitly passed one."
+    except Exception as e:
+        pytest.fail(f"FactExtractionAgent initialization failed unexpectedly: {e}")
+
+def test_fea_init_type_error_for_invalid_lsw(mock_mmu): # Using mock_mmu as an invalid type
+    """
+    Tests that FactExtractionAgent raises a TypeError if not initialized
+    with an LLMServiceWrapper instance.
+    """
+    with pytest.raises(TypeError) as excinfo:
+        FactExtractionAgent(lsw=mock_mmu) # Pass an incorrect type (MockMMU)
+    
+    assert "FactExtractionAgent requires an instance of LLMServiceWrapper" in str(excinfo.value)
+
+def test_fea_extract_facts_success_default_model(mock_lsw, isolated_agent_config):
+    """Tests extract_facts successfully extracts and parses valid JSON facts."""
+    agent_default_extractor_model = isolated_agent_config['agents']['fact_extraction_agent_model']
+    fea = FactExtractionAgent(lsw=mock_lsw, default_model_name=agent_default_extractor_model)
+
+    text_to_process = "User's name is Alice and she lives in Wonderland."
+    # Simulate LSW returning a valid JSON string list
+    mock_llm_json_response = json.dumps([
+        {"subject": "user name", "predicate": "is", "object": "Alice"},
+        {"subject": "user location", "predicate": "lives in", "object": "Wonderland"}
+    ])
+    mock_lsw.generate_chat_completion.return_value = mock_llm_json_response
+    
+    extracted_facts = fea.extract_facts(text_to_process)
+
+    assert isinstance(extracted_facts, list)
+    assert len(extracted_facts) == 2
+    assert extracted_facts[0] == {"subject": "user name", "predicate": "is", "object": "Alice"}
+    assert extracted_facts[1] == {"subject": "user location", "predicate": "lives in", "object": "Wonderland"}
+
+    # Verify LSW call
+    assert mock_lsw.generate_chat_completion.called
+    call_args_kwargs = mock_lsw.generate_chat_completion.call_args.kwargs
+    assert call_args_kwargs.get("model_name") == agent_default_extractor_model
+    assert text_to_process in call_args_kwargs["messages"][1]["content"] # Check text is in prompt
+    assert "JSON list of objects" in call_args_kwargs["messages"][1]["content"] # Check for JSON instruction
+    assert call_args_kwargs.get("temperature") == 0.0 # Default temp for extract_facts
+
+def test_fea_extract_facts_explicit_model_and_params(mock_lsw):
+    """Tests extract_facts with an explicit model and temperature."""
+    fea = FactExtractionAgent(lsw=mock_lsw) # Uses mock_lsw's default model initially
+    
+    custom_model = "custom-extractor:v2"
+    custom_temp = 0.1
+    text_to_process = "Project Zeta deadline is next Friday."
+    mock_llm_json_response = json.dumps([
+        {"subject": "Project Zeta deadline", "predicate": "is", "object": "next Friday"}
+    ])
+    mock_lsw.generate_chat_completion.return_value = mock_llm_json_response
+
+    extracted_facts = fea.extract_facts(
+        text_to_process=text_to_process,
+        model_name=custom_model,
+        temperature=custom_temp
+    )
+    assert len(extracted_facts) == 1
+    assert extracted_facts[0]["subject"] == "Project Zeta deadline"
+
+    call_args_kwargs = mock_lsw.generate_chat_completion.call_args.kwargs
+    assert call_args_kwargs.get("model_name") == custom_model
+    assert call_args_kwargs.get("temperature") == custom_temp
+
+def test_fea_extract_facts_llm_returns_empty_list_json(mock_lsw):
+    """Tests extract_facts when LLM returns an empty JSON list '[]'."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    mock_lsw.generate_chat_completion.return_value = "[]" # Empty list as JSON string
+    
+    extracted_facts = fea.extract_facts("No extractable facts here.")
+    assert isinstance(extracted_facts, list)
+    assert len(extracted_facts) == 0
+
+def test_fea_extract_facts_llm_returns_malformed_json(mock_lsw, capsys):
+    """Tests extract_facts when LLM returns a malformed JSON string."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    malformed_json = '[{"subject": "user name", "predicate": "is", "object": "Bob"}' # Missing closing bracket
+    mock_lsw.generate_chat_completion.return_value = malformed_json
+
+    extracted_facts = fea.extract_facts("Some text.")
+    assert extracted_facts is None # Should return None on JSONDecodeError
+    
+    captured = capsys.readouterr()
+    assert "Failed to decode LLM response as JSON" in captured.out
+
+def test_fea_extract_facts_llm_returns_valid_json_not_a_list(mock_lsw, capsys):
+    """Tests extract_facts when LLM returns valid JSON that is not a list."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    json_not_a_list = json.dumps({"fact": "this is not a list"})
+    mock_lsw.generate_chat_completion.return_value = json_not_a_list
+
+    extracted_facts = fea.extract_facts("Some text.")
+    assert isinstance(extracted_facts, list) # FEA converts to empty list
+    assert len(extracted_facts) == 0
+    
+    captured = capsys.readouterr()
+    assert "LLM output was valid JSON but not a list as expected" in captured.out
+
+def test_fea_extract_facts_with_malformed_items_in_list(mock_lsw):
+    """Tests extract_facts when JSON list contains some malformed fact items."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    mock_llm_json_response = json.dumps([
+        {"subject": "user email", "predicate": "is", "object": "test@example.com"},
+        {"sub": "missing_keys", "pred": "is"}, # Malformed item
+        {"subject": "user city", "predicate": "lives in", "object": "Testville"},
+        "just a string item" # Also malformed
+    ])
+    mock_lsw.generate_chat_completion.return_value = mock_llm_json_response
+
+    extracted_facts = fea.extract_facts("Text with mixed quality facts.")
+    assert isinstance(extracted_facts, list)
+    assert len(extracted_facts) == 2 # Only two valid facts should be returned
+    assert extracted_facts[0]["subject"] == "user email"
+    assert extracted_facts[1]["subject"] == "user city"
+
+def test_fea_extract_facts_empty_input_text(mock_lsw):
+    """Tests extract_facts with empty or whitespace input text."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    mock_lsw.generate_chat_completion.reset_mock() # Ensure it's not called
+
+    facts_empty = fea.extract_facts("")
+    facts_whitespace = fea.extract_facts("   \n ")
+
+    assert isinstance(facts_empty, list) and len(facts_empty) == 0
+    assert isinstance(facts_whitespace, list) and len(facts_whitespace) == 0
+    mock_lsw.generate_chat_completion.assert_not_called()
+
+def test_fea_extract_facts_lsw_returns_none(mock_lsw):
+    """Tests extract_facts when LSW's generate_chat_completion returns None."""
+    fea = FactExtractionAgent(lsw=mock_lsw)
+    mock_lsw.generate_chat_completion.return_value = None # Simulate LSW failure
+
+    extracted_facts = fea.extract_facts("Some valid text for extraction.")
+    # Current FEA returns None if LSW returns None.
+    assert extracted_facts is None
