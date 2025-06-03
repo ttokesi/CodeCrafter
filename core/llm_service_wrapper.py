@@ -99,8 +99,8 @@ class LLMServiceWrapper:
                          Returns None if an error occurs.
         """
         if not self.client:
-            print("Error: Ollama client not initialized.")
-            return None
+            print("LSW_ERROR: Ollama client not initialized.") # Changed to LSW_ERROR
+            return None if not stream else iter([]) # Return empty iter if stream expected
         
         model_to_use = model_name if model_name else self.default_chat_model
         options = {"temperature": temperature}
@@ -112,45 +112,79 @@ class LLMServiceWrapper:
         for key, value in kwargs.items(): # For flat kwargs
             if key not in ['options', 'model', 'messages', 'stream', 'format', 'keep_alive']: # Avoid overriding core args
                  options[key] = value
-
+        
+        response_stream = None # Initialize to None
         try:
-            response_stream = self.client.chat( # Renamed to response_stream for clarity
+            print(f"LSW_DEBUG: About to call self.client.chat with model='{model_to_use}', stream={stream}, options={options}") # New
+            response_stream = self.client.chat(
                 model=model_to_use,
                 messages=messages,
-                stream=stream, # This will be True for streaming calls
+                stream=stream,
                 options=options
             )
-
+            print(f"LSW_DEBUG: self.client.chat call successful. Type of response_stream: {type(response_stream)}")
             if stream:
-                # print("LSW: Streaming response...") # Optional debug
-                def content_generator():
-                    full_response_for_debug = "" # For debugging if needed
-                    for chunk in response_stream:
-                        # The structure of a chunk from ollama.Client.chat (stream=True) is like:
-                        # {'model': 'gemma3:1b-it-fp16', 'created_at': '...', 'message': {'role': 'assistant', 'content': 'some text'}, 'done': False/True}
-                        # Sometimes, 'content' might be missing or empty in intermediate chunks if only metadata changes.
-                        # Or the very last chunk might have 'done': True and empty 'content'.
+                print(f"LSW_DEBUG: response_stream (for stream=True) raw object: {str(response_stream)[:500]}")
+
+        except Exception as client_chat_error: # Catch error from self.client.chat()
+            print(f"LSW_CRITICAL_ERROR: Exception directly from self.client.chat() for model '{model_to_use}', stream={stream}.")
+            print(f"  Error Type: {type(client_chat_error)}")
+            print(f"  Error Args: {client_chat_error.args}")
+            print(f"  Error String: {str(client_chat_error)}")
+            import traceback
+            traceback.print_exc()
+            return None if not stream else iter([]) # Consistent error return
+
+        # If self.client.chat() succeeded, proceed to define and return content_generator for streams
+        if stream:
+            if response_stream is None: # Should not happen if no exception, but a safeguard
+                print("LSW_ERROR: response_stream is None after client.chat call for streaming, but no exception was caught.")
+                return iter([])
+
+            def content_generator():
+                full_response_for_debug = "" 
+                print("LSW_STREAM_DEBUG: content_generator started.")
+                try:
+                    for i, chunk in enumerate(response_stream): # chunk is ollama._types.ChatResponse
+                        print(f"LSW_STREAM_DEBUG: Raw chunk {i}: {chunk}")
+                        print(f"LSW_STREAM_DEBUG: Type of chunk {i}: {type(chunk)}")
+
+                        # --- MODIFIED ACCESS TO CHUNK DATA ---
+                        content_piece = ""
+                        if hasattr(chunk, 'message') and chunk.message and hasattr(chunk.message, 'content'):
+                            content_piece = chunk.message.content
+                        # --- END MODIFIED ACCESS ---
                         
-                        message_part = chunk.get('message', {})
-                        content_piece = message_part.get('content', '')
-                        
-                        if content_piece: # Only yield if there's actual text content
-                            # full_response_for_debug += content_piece # Optional: accumulate for logging
+                        if content_piece: # Only yield if there's actual content
+                            print(f"LSW_STREAM_DEBUG: Yielding content_piece: '{content_piece[:50]}...'")
                             yield content_piece
+                            full_response_for_debug += content_piece
                         
-                        # Check if this is the final chunk and if there was no content in it
-                        if chunk.get('done') is True and not content_piece:
-                            # print(f"LSW: Stream finished. Full response for debug: {full_response_for_debug}") # Optional
-                            break # Stop generation
-                return content_generator() # Return the generator
-            else: # Non-streaming
-                # When stream=False, response_stream is actually the complete response dictionary
-                full_response_content = response_stream['message']['content']
-                return full_response_content
-        except Exception as e:
-            print(f"Error during Ollama chat completion with model '{model_to_use}': {e}")
-            if stream: return iter([]) # Return an empty iterator on error for stream
-            return None # Return None on error for non-stream
+                        # Access 'done' attribute
+                        done_flag = False
+                        if hasattr(chunk, 'done'):
+                            done_flag = chunk.done
+                        
+                        if done_flag is True:
+                            print(f"LSW_STREAM_DEBUG: Done flag is True for chunk {i}.")
+                            # If the 'done' chunk also had content, it was yielded above.
+                            # If it's a final 'done' chunk with no new content, just break.
+                            if not content_piece:
+                                 print(f"LSW_STREAM_DEBUG: Final 'done' chunk {i} had no new content. Stopping.")
+                            break 
+                    print(f"LSW_STREAM_DEBUG: content_generator loop finished. Full response: {full_response_for_debug[:200]}...")
+                except Exception as stream_gen_ex:
+                    print(f"LSW_STREAM_ERROR: Error within LSW's content_generator stream: Type {type(stream_gen_ex)}, {stream_gen_ex}")
+                    import traceback
+                    traceback.print_exc()
+            return content_generator()
+        
+        else: # Non-streaming (this part seems to work fine)
+            if response_stream is None: # Should not happen if no exception
+                 print("LSW_ERROR: response_stream is None after client.chat call for non-streaming, but no exception was caught.")
+                 return None
+            full_response_content = response_stream['message']['content']
+            return full_response_content
 
     def generate_embedding(self,
                            text_to_embed: str,

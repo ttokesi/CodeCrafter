@@ -28,6 +28,56 @@ else: # When imported as part of a package
     from .tokenizer_utils import count_tokens
     from .config_loader import get_config, get_project_root # <--- AND HERE
 
+AVAILABLE_TOOLS = [
+    {
+        "tool_name": "knowledge_search",
+        "description": "Searches your long-term memory (knowledge base of facts and records of past conversations) for information relevant to a specific query. Use this when you need to answer a user's question, find specific details from the past, or recall previously learned information. Do NOT use this for general knowledge questions if the information is unlikely to be in your specific memory.",
+        "argument_schema": {
+            "type": "object",
+            "properties": {
+                "query_text": {
+                    "type": "string",
+                    "description": "The specific question or search query to look up in the knowledge base. Be precise and use keywords from the user's request if applicable."
+                }
+            },
+            "required": ["query_text"]
+        }
+    },
+    {
+        "tool_name": "text_summarizer",
+        "description": "Generates a concise summary of a given piece of text. Use this tool if you have a long piece of text (e.g., a retrieved document or a long segment of conversation) that needs to be shortened while retaining the main points, or if the user explicitly asks for a summary.",
+        "argument_schema": {
+            "type": "object",
+            "properties": {
+                "text_to_summarize": {
+                    "type": "string",
+                    "description": "The text content that needs to be summarized."
+                },
+                "target_token_length": {
+                    "type": "integer",
+                    "description": "Optional. Suggest an approximate desired length of the summary in tokens (e.g., 50, 100, 150). If unsure, omit this."
+                }
+            },
+            "required": ["text_to_summarize"]
+        }
+    },
+    {
+        "tool_name": "fact_extractor",
+        "description": "Identifies and extracts new, explicit factual statements made by the user about themselves, their preferences, or specific entities they mention. Use this when the user provides a new piece of information that seems important to remember for future interactions (e.g., 'My name is John,' 'My favorite color is blue,' 'Project Alpha is due next week'). Do NOT use this for questions the user asks or for your own statements.",
+        "argument_schema": {
+            "type": "object",
+            "properties": {
+                "text_to_process": {
+                    "type": "string",
+                    "description": "The user's statement from which to extract new facts."
+                }
+            },
+            "required": ["text_to_process"]
+        }
+    }
+]
+# --- End Definition of Available Tools ---
+
 class ConversationOrchestrator:
     def __init__(self, 
                  mmu: MemoryManagementUnit, 
@@ -81,45 +131,71 @@ class ConversationOrchestrator:
         self.fe_common_fillers = fe_cfg.get('common_fillers_for_filter', [])
         self.fe_question_indicators_check = fe_cfg.get('question_indicators_for_filter', [])
         
+        self.react_system_prompt_template = co_config.get('react_system_prompt_template', "Warning: ReAct system prompt template not found in config!")
+
         self.active_conversation_id = None
         
         print("ConversationOrchestrator initialized (using configuration).")
         print(f"  CO - Default LLM model for responses: {self.default_llm_model}")
         print(f"  CO - Target max prompt tokens: {self.target_max_prompt_tokens}")
         print(f"  CO - Min tokens for VS learn: {self.min_tokens_for_vs_learn}")
-        # --- Add print statements for new configs for verification ---
         print(f"  CO - Manage STM in prompt: {self.manage_stm_within_prompt}")
         print(f"  CO - STM Condensation Strategy: {self.stm_condensation_strategy}")
         print(f"  CO - STM Token Budget Ratio: {self.target_stm_tokens_budget_ratio}")
         print(f"  CO - STM Summary Target Tokens: {self.stm_summary_target_tokens}")
-        # --- End print statements ---
+        print(f"  CO - Loaded ReAct System Prompt Template: {'Yes' if 'Warning:' not in self.react_system_prompt_template else 'NO - Check config!'}")
+        
+    def _format_available_tools_for_prompt(self) -> str:
+        """
+        Formats the AVAILABLE_TOOLS list into a string suitable for inclusion
+        in the system prompt.
+        """
+        if not AVAILABLE_TOOLS: # Global constant
+            return "No tools are currently available."
+
+        tool_descriptions = []
+        for i, tool_spec in enumerate(AVAILABLE_TOOLS):
+            tool_info = f"{i+1}. Tool Name: {tool_spec['tool_name']}\n"
+            tool_info += f"   Description: {tool_spec['description']}\n"
+            tool_info += f"   Argument Schema:\n```json\n{json.dumps(tool_spec['argument_schema'], indent=4)}\n```\n---"
+            tool_descriptions.append(tool_info)
+        
+        return "\n".join(tool_descriptions)
 
     def _build_prompt_with_context(self,
-                                   conversation_id: str, # No longer needed as param if self.active_conversation_id is used
                                    user_query: str,
-                                   retrieved_knowledge: dict
+                                   retrieved_knowledge: dict,
+                                   observation: str = None 
                                   ) -> list:
         #print("  CO: Building prompt with context...")
         target_ollama_model_for_tokens = self.default_llm_model 
         summarization_llm_model = self.summarizer.default_model_name
 
+        tools_description_str = self._format_available_tools_for_prompt()
+
         # 1. System Prompt
-        system_message_content = (
-            "You are a helpful and knowledgeable AI assistant. " 
-            "Your primary goal is to answer the user's questions accurately and coherently. "
-            "You have access to your short-term conversation memory and relevant information retrieved from your long-term knowledge base. "
-            "Prioritize using the 'RETRIEVED KNOWLEDGE CONTEXT' section to answer if it's relevant. "
-            "If the retrieved context does not contain enough information, use your general knowledge but clearly state that the information is not from your specific knowledge base. "
-            "If you cannot answer the question based on either retrieved context or general knowledge, say so clearly. "
-            "Do not invent facts or information. Be concise unless asked for detail. "
-            "When you use information directly from the 'RETRIEVED KNOWLEDGE CONTEXT' to answer, confidently state that you are recalling this specific information (e.g., 'I recall that X...' or 'Based on what I have in my knowledge base about Y...'). If the context is partial, you can say 'I have some information indicating that...'."  # <-- MODIFIED LINE
+        system_message_content = self.react_system_prompt_template.format(
+            available_tools_description_string=tools_description_str
         )
         system_tokens = count_tokens(system_message_content, target_ollama_model_for_tokens)
         current_total_tokens = system_tokens
-        print(f"    Tokens - System message: {system_tokens}")
+        print(f"    Tokens - System message (ReAct): {system_tokens}")
         messages = [{"role": "system", "content": system_message_content}]
+
         knowledge_context_str_parts = []
         
+        # --- ADD OBSERVATION TO CONTEXT if present ---
+        if observation:
+            observation_str = f"OBSERVATION:\n{observation}"
+            observation_tokens = count_tokens(observation_str, target_ollama_model_for_tokens)
+            # Add observation before LTM, as it's more immediate context from tool use
+            if current_total_tokens + observation_tokens < self.target_max_prompt_tokens:
+                knowledge_context_str_parts.append(observation_str)
+                current_total_tokens += observation_tokens
+            else:
+                print(f"    WARNING: Observation was too long to fit in prompt ({observation_tokens} tokens).")
+        # --- END OBSERVATION ---
+
         # SKB Facts
         if retrieved_knowledge.get("skb_fact_results"):
             added_skb_title = False
@@ -427,13 +503,37 @@ class ConversationOrchestrator:
         )
 
         # Build Prompt (uses self.active_conversation_id, other self. attributes for limits)
-        llm_messages = self._build_prompt_with_context(
-            conversation_id=self.active_conversation_id, # Pass current active ID
-            user_query=user_message, retrieved_knowledge=retrieved_knowledge
-        )
+        llm_messages = None # Initialize
+        try:
+            print("CO_DEBUG: About to call _build_prompt_with_context...") # New debug
+            llm_messages = self._build_prompt_with_context(
+                user_query=user_message, 
+                retrieved_knowledge=retrieved_knowledge
+                # observation is not passed yet
+            )
+            print("CO_DEBUG: _build_prompt_with_context call successful.") # New debug
+        except Exception as build_prompt_error:
+            print(f"CO_CRITICAL_ERROR: Exception during _build_prompt_with_context!")
+            print(f"  Error Type: {type(build_prompt_error)}")
+            print(f"  Error Args: {build_prompt_error.args}")
+            print(f"  Error String: {str(build_prompt_error)}")
+            import traceback
+            traceback.print_exc()
+            # If prompt building fails, we can't proceed to LSW call for main response
+            yield "I'm sorry, I had trouble preparing my thoughts for a response."
+            # Log this critical failure (simplified logging for now)
+            # ... (logging logic would go here if we want to record this type of error) ...
+            return # Exit the handle_user_message generator
+
+        # If llm_messages is None after try-except (though it shouldn't be if no error, but as a safeguard)
+        if llm_messages is None:
+            print("CO_ERROR: llm_messages is None after _build_prompt_with_context, even without explicit error.")
+            yield "I seem to be having a problem formulating a response."
+            return
+
+        print(f"CO_DEBUG: Messages being sent to LSW for main response: {json.dumps(llm_messages, indent=2)}")
         
-        # LSW Call (uses self.default_llm_model from config)
-        assistant_response_stream = self.lsw.generate_chat_completion(
+        assistant_response_stream = self.lsw.generate_chat_completion( # This call is for the main response
             messages=llm_messages, model_name=self.default_llm_model, temperature=0.5, stream=True
         )
 
@@ -471,10 +571,12 @@ class ConversationOrchestrator:
                 accumulated_response_for_ltm = fallback_message
 
         except Exception as e:
-            print(f"  CO: Error consuming LLM stream: {e}")
+            print(f"  CO: Error consuming LLM stream. Type: {type(e)}, Error: {e}") # More detail
+            import traceback # Import for full traceback
+            traceback.print_exc() # Print the full traceback
             error_message = "Sorry, there was an error while I was generating my response."
-            yield error_message # Yield error to user
-            accumulated_response_for_ltm = error_message # Log this error
+            yield error_message 
+            accumulated_response_for_ltm = error_message
              
         #print(f"  CO: Full assistant response (accumulated): \"{accumulated_response_for_ltm[:100].strip()}...\"")
         self.mmu.add_stm_turn(role="assistant", content=accumulated_response_for_ltm)

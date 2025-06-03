@@ -585,11 +585,12 @@ def test_lsw_gcc_stream_client_not_initialized(monkeypatch, isolated_config_for_
         raise Exception("Simulated Ollama client init error for GCC stream test")
     monkeypatch.setattr(ollama, 'Client', mock_ollama_client_constructor_raises_error)
 
-    lsw = LLMServiceWrapper()
+    lsw = LLMServiceWrapper() # LSW __init__ will set self.client to None
     assert lsw.client is None
 
     response_generator = lsw.generate_chat_completion(messages=[{"role": "user", "content": "Hi"}], stream=True)
-    assert response_generator is None # Expect None if client is not initialized
+    assert hasattr(response_generator, '__iter__') # Should be an iterator
+    assert list(response_generator) == [] # Consuming it should yield an empty list
 
 
 def test_lsw_ge_ollama_success_default_model(monkeypatch, isolated_config_for_lsw):
