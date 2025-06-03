@@ -185,6 +185,25 @@ class MockSentenceTransformer:
         # If sentences is a single string
         return [0.05] * 10 # Default single dummy 10-dim embedding
 
+class MockChatResponseChunk: # Helper for streaming tests
+    def __init__(self, content, done, role="assistant"):
+        class Message:
+            def __init__(self, content, role):
+                self.content = content
+                self.role = role
+        self.message = Message(content=content, role=role)
+        self.done = done
+        # Add other attributes if LSW starts using them from the chunk
+        self.model = "mock_chunk_model" 
+        self.created_at = "mock_chunk_time"
+        # ... any other fields that might be accessed by LSW, even if just for logging
+        self.done_reason = 'stop' if done else None
+        self.total_duration = 0
+        self.load_duration = 0
+        self.prompt_eval_count = 0
+        self.prompt_eval_duration = 0
+        self.eval_count = 0
+        self.eval_duration = 0
 # --- End Helper Fixtures and Mock Classes ---
 
 def test_lsw_init_uses_mocked_global_config_and_initializes_clients(monkeypatch, isolated_config_for_lsw):
@@ -500,13 +519,13 @@ def test_lsw_gcc_stream_success(monkeypatch, isolated_config_for_lsw):
     """Tests generate_chat_completion (streamed) successfully yields content."""
     mock_ollama_client = MockOllamaClient()
     # Define the sequence of chunks our mock client's chat() method should yield
+    # test_lsw_gcc_stream_success
     mock_stream_chunks = [
-        {"message": {"role": "assistant", "content": "Hel"}, "done": False},
-        {"message": {"role": "assistant", "content": "lo "}, "done": False},
-        {"message": {"role": "assistant", "content": "World!"}, "done": False}, # LSW should handle this
-        {"message": {"role": "assistant", "content": ""}, "done": True} # Final chunk, empty content
+        MockChatResponseChunk(content="Hel", done=False),
+        MockChatResponseChunk(content="lo ", done=False),
+        MockChatResponseChunk(content="World!", done=False),
+        MockChatResponseChunk(content="", done=True) # Final chunk
     ]
-    # Make the mock_chat_response_stream return an iterator of these chunks
     mock_ollama_client.mock_chat_response_stream = iter(mock_stream_chunks)
 
     monkeypatch.setattr(ollama, 'Client', lambda host=None: mock_ollama_client)
@@ -530,11 +549,10 @@ def test_lsw_gcc_stream_empty_content_chunks(monkeypatch, isolated_config_for_ls
     """Tests GCC (streamed) when some chunks have no content but are not 'done'."""
     mock_ollama_client = MockOllamaClient()
     mock_stream_chunks = [
-        {"message": {"role": "assistant", "content": "Data"}, "done": False},
-        {"message": {"role": "assistant", "content": None}, "done": False}, # Chunk with None content
-        {"message": {"role": "assistant"}, "done": False},                 # Chunk missing content key
-        {"message": {"role": "assistant", "content": "More"}, "done": False},
-        {"message": {"role": "assistant", "content": ""}, "done": True}
+        MockChatResponseChunk(content="Data", done=False),
+        MockChatResponseChunk(content=None, done=False), # Handled by LSW if content is None
+        MockChatResponseChunk(content="More", done=False),
+        MockChatResponseChunk(content="", done=True)
     ]
     mock_ollama_client.mock_chat_response_stream = iter(mock_stream_chunks)
     monkeypatch.setattr(ollama, 'Client', lambda host=None: mock_ollama_client)
@@ -548,7 +566,7 @@ def test_lsw_gcc_stream_ollama_api_error_during_stream(monkeypatch, isolated_con
     mock_ollama_client = MockOllamaClient()
 
     def erroring_stream_generator():
-        yield {"message": {"content": "First part..."}, "done": False}
+        yield MockChatResponseChunk(content="First part...", done=False)
         raise Exception("Simulated network error during stream")
 
     mock_ollama_client.mock_chat_response_stream = erroring_stream_generator

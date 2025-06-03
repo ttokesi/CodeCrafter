@@ -146,8 +146,8 @@ class LLMServiceWrapper:
                 print("LSW_STREAM_DEBUG: content_generator started.")
                 try:
                     for i, chunk in enumerate(response_stream): # chunk is ollama._types.ChatResponse
-                        print(f"LSW_STREAM_DEBUG: Raw chunk {i}: {chunk}")
-                        print(f"LSW_STREAM_DEBUG: Type of chunk {i}: {type(chunk)}")
+                        #print(f"LSW_STREAM_DEBUG: Raw chunk {i}: {chunk}")
+                        #print(f"LSW_STREAM_DEBUG: Type of chunk {i}: {type(chunk)}")
 
                         # --- MODIFIED ACCESS TO CHUNK DATA ---
                         content_piece = ""
@@ -156,7 +156,7 @@ class LLMServiceWrapper:
                         # --- END MODIFIED ACCESS ---
                         
                         if content_piece: # Only yield if there's actual content
-                            print(f"LSW_STREAM_DEBUG: Yielding content_piece: '{content_piece[:50]}...'")
+                            #print(f"LSW_STREAM_DEBUG: Yielding content_piece: '{content_piece[:50]}...'")
                             yield content_piece
                             full_response_for_debug += content_piece
                         

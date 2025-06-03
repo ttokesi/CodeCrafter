@@ -505,13 +505,13 @@ class ConversationOrchestrator:
         # Build Prompt (uses self.active_conversation_id, other self. attributes for limits)
         llm_messages = None # Initialize
         try:
-            print("CO_DEBUG: About to call _build_prompt_with_context...") # New debug
+            #print("CO_DEBUG: About to call _build_prompt_with_context...") # New debug
             llm_messages = self._build_prompt_with_context(
                 user_query=user_message, 
                 retrieved_knowledge=retrieved_knowledge
                 # observation is not passed yet
             )
-            print("CO_DEBUG: _build_prompt_with_context call successful.") # New debug
+            #print("CO_DEBUG: _build_prompt_with_context call successful.") # New debug
         except Exception as build_prompt_error:
             print(f"CO_CRITICAL_ERROR: Exception during _build_prompt_with_context!")
             print(f"  Error Type: {type(build_prompt_error)}")
@@ -531,7 +531,7 @@ class ConversationOrchestrator:
             yield "I seem to be having a problem formulating a response."
             return
 
-        print(f"CO_DEBUG: Messages being sent to LSW for main response: {json.dumps(llm_messages, indent=2)}")
+        #print(f"CO_DEBUG: Messages being sent to LSW for main response: {json.dumps(llm_messages, indent=2)}")
         
         assistant_response_stream = self.lsw.generate_chat_completion( # This call is for the main response
             messages=llm_messages, model_name=self.default_llm_model, temperature=0.5, stream=True
