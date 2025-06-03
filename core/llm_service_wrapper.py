@@ -199,8 +199,22 @@ class LLMServiceWrapper:
 
             try:
                 # print(f"LSW: Generating SentenceTransformer embedding with model '{self.default_embedding_model_st}'")
-                # .tolist() converts numpy array to Python list
-                embedding = self.st_model.encode(text_to_embed, convert_to_tensor=False).tolist()
+                encoded_output = self.st_model.encode(text_to_embed, convert_to_tensor=False)
+                if hasattr(encoded_output, 'tolist'): # Check if it has tolist() method (like numpy arrays)
+                    embedding = encoded_output.tolist()
+                elif isinstance(encoded_output, list): # Check if it's already a list
+                    embedding = encoded_output
+                else:
+                    # If it's neither, this is unexpected, or we need to handle other types
+                    print(f"Warning: SentenceTransformer encode() returned an unexpected type: {type(encoded_output)}")
+                    # Attempt to convert to list if it's some other iterable, or handle error
+                    try:
+                        embedding = list(encoded_output) # Fallback attempt
+                        if not embedding or not isinstance(embedding[0], (float, int)): # Basic check
+                            raise TypeError("Fallback list conversion did not yield list of numbers.")
+                    except TypeError as te:
+                        print(f"Error: Could not convert ST output to list of floats. {te}")
+                        return None
                 return embedding
             except Exception as e:
                 print(f"Error generating SentenceTransformer embedding: {e}")
