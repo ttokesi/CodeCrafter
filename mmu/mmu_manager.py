@@ -371,8 +371,8 @@ class MemoryManagementUnit:
         # Pass through kwargs to LTMManager's log_interaction
         return self.ltm.log_interaction(conversation_id, turn_sequence_id, role, content, **kwargs)
 
-    def get_ltm_conversation_history(self, conversation_id: str, limit: int = None, offset: int = 0) -> list:
-        return self.ltm.get_conversation_history(conversation_id, limit, offset)
+    def get_ltm_conversation_history(self, conversation_id: str, limit: int = None, offset: int = 0, order_desc: bool = False) -> list: # Ensure order_desc is here
+        return self.ltm.get_conversation_history(conversation_id, limit, offset, order_desc=order_desc) # Pass order_desc through
     
     def get_ltm_all_conversation_ids(self) -> list:
         return self.ltm.get_all_conversation_ids()

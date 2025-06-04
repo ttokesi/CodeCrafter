@@ -119,37 +119,26 @@ class RawConversationLog:
             print(f"SQLite error during log_interaction: {e}")
             return None
 
-    def get_conversation_history(self, conversation_id: str, limit: int = None, offset: int = 0) -> list:
-        """
-        Retrieves the history for a specific conversation, ordered by turn sequence.
-
-        Args:
-            conversation_id (str): The ID of the conversation to retrieve.
-            limit (int, optional): Maximum number of turns to retrieve.
-            offset (int, optional): Number of turns to skip from the beginning.
-
-        Returns:
-            list: A list of dictionaries, where each dictionary represents a turn.
-                  Returns an empty list if no history is found or an error occurs.
-        """
+    def get_conversation_history(self, conversation_id: str, limit: int = None, offset: int = 0, order_desc: bool = False) -> list: # Ensure order_desc is here
         try:
             with self._get_connection() as conn:
                 conn.row_factory = sqlite3.Row # This allows accessing columns by name
                 cursor = conn.cursor()
-                
-                query = '''
+                order_direction = "DESC" if order_desc else "ASC" # New
+                query = f'''
                     SELECT * FROM conversation_log
                     WHERE conversation_id = ?
-                    ORDER BY turn_sequence_id ASC
-                '''
+                    ORDER BY turn_sequence_id {order_direction} 
+                ''' # Use f-string for order_direction
                 params = [conversation_id]
 
                 if limit is not None:
                     query += " LIMIT ?"
                     params.append(limit)
-                if offset > 0 : # Add offset only if it is greater than 0, SQLite LIMIT takes offset as second param in LIMIT X, Y
-                    if limit is None: # If no limit, we need a large number for limit before offset
-                        query += " LIMIT -1" # SQLite specific way to say no limit
+                # Offset logic needs to be careful with DESC order if used for pagination
+                # For "get last item", offset is usually 0 with DESC.
+                if offset > 0 : 
+                    if limit is None: query += " LIMIT -1"
                     query += " OFFSET ?"
                     params.append(offset)
                 

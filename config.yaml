@@ -3,7 +3,7 @@
 # LLM Service Wrapper (LSW) Configuration
 lsw:
   ollama_host: "http://localhost:11434" # Usually fine as is.
-  default_chat_model: "gemma3:4b-it-fp16" # IS THIS YOUR BEST/PREFERRED GENERAL MODEL?
+  default_chat_model: "gemma3:12b-it-fp16" # IS THIS YOUR BEST/PREFERRED GENERAL MODEL?
                                          # Ensure it's pulled in Ollama.
   default_embedding_model_ollama: "nomic-embed-text" # Good default, ensure pulled.
   default_embedding_model_st: "all-MiniLM-L6-v2"    # Good general ST model.
@@ -74,19 +74,17 @@ orchestrator:
     **Tool Usage Instructions:**
 
     1.  **Decision to Use a Tool:** Based on the user's query and the current context (conversation history, retrieved knowledge), decide if using a tool would be beneficial.
-    2.  **Output Format for Tool Call:** If you decide to use a tool, your response MUST start *exactly* with the line `TOOL_CALL:` followed by a JSON object enclosed in a markdown code block (```json ... ```) on the subsequent lines. This JSON object must contain:
-        *   A `tool_name` key: The name of the tool you want to use.
-        *   An `arguments` key: An object containing the arguments for that tool, matching its specified schema.
+    2.  **Output Format for Tool Call:** If you decide to use a tool, your response MUST start *exactly* with the line `TOOL_CALL:` followed immediately on the next line(s) by a single, valid JSON object. This JSON object must contain:
+        *   A `tool_name` key (string): The name of the tool you want to use.
+        *   An `arguments` key (object): An object containing the arguments for that tool, matching its specified schema.
         Example of a tool call:
         TOOL_CALL:
-        ```json
-        {{
+        {{ # Escaped for Python .format()
             "tool_name": "knowledge_search",
             "arguments": {{
                 "query_text": "What is my project's deadline?"
             }}
         }}
-        ```
     3.  **No Tool Needed (Direct Answer):** If you do not need to use a tool, simply provide your answer or response directly as plain text. Do NOT use the `TOOL_CALL:` prefix.
 
     **Available Tools:**
@@ -128,8 +126,8 @@ orchestrator:
 # Agent specific model overrides
 agents:
   # If these agents should use a different (perhaps smaller/faster) model than the CO's main chat model
-  summarization_agent_model: "gemma3:1b-it-fp16" # Good choice for a faster summarizer. Ensure pulled.
-  fact_extraction_agent_model: "gemma3:1b-it-fp16" # Good choice for faster fact extraction. Ensure pulled.
+  summarization_agent_model: "gemma3:4b-it-fp16" # Good choice for a faster summarizer. Ensure pulled.
+  fact_extraction_agent_model: "gemma3:4b-it-fp16" # Good choice for faster fact extraction. Ensure pulled.
 
 # Data directory (base for relative paths above)
 data_dir: "data"

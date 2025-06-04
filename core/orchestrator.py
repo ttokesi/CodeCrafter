@@ -2,10 +2,10 @@
 import uuid 
 import os      
 import shutil  
-import time    
+import time
 import gc      
-import datetime
 import json
+from datetime import datetime, timezone
 
 
 # Conditional imports
@@ -350,7 +350,7 @@ class ConversationOrchestrator:
                             summary_tokens = count_tokens(summary_of_older_stm, target_ollama_model_for_tokens)
                             print(f"      STM Summarize: Generated summary ({summary_tokens} tokens): \"{summary_of_older_stm[:100].strip()}...\"")
                             if summary_tokens <= remaining_budget_for_summary:
-                                summary_turn = {"role": "system", "content": f"[Summary of earlier conversation]: {summary_of_older_stm}", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                                summary_turn = {"role": "system", "content": f"[Summary of earlier conversation]: {summary_of_older_stm}", "timestamp": datetime.now(timezone.utc).isoformat()}
                                 managed_stm_turns_for_prompt = [summary_turn] + temp_turns_to_keep_verbatim 
                             else:
                                 print(f"      STM Summarize: Generated summary ({summary_tokens} tokens) is too long for remaining budget ({remaining_budget_for_summary}). Discarding summary, keeping verbatim.")
@@ -554,53 +554,202 @@ class ConversationOrchestrator:
             self.mmu.add_stm_turn(role="assistant", content=error_message)
             return # Stop generation
 
+        # --- MODIFIED STREAM HANDLING FOR TOOL CALL DETECTION ---
         accumulated_response_for_ltm = ""
-        has_yielded_content = False
-        try:
-            for chunk in assistant_response_stream:
-                if chunk: # Ensure chunk is not empty
-                    # print(f"CO yielding chunk: '{chunk}'") # Debug: very verbose
-                    yield chunk
-                    accumulated_response_for_ltm += chunk
-                    has_yielded_content = True
+        leading_buffer = "" # Buffer to check for TOOL_CALL:
+        # Max buffer size before deciding if it's a direct answer or tool call.
+        # Needs to be large enough to contain "TOOL_CALL:\n```json\n"
+        # "TOOL_CALL:" is 10 chars. Let's say ~50 chars to be safe.
+        MAX_LEAD_BUFFER_SIZE = 64 
+        
+        is_tool_call_detected = False
+        json_block_started = False
+        json_content_buffer = ""
+        
+        # This will be the generator we return, which wraps the logic
+        def response_processor_generator():
+            nonlocal accumulated_response_for_ltm, leading_buffer, is_tool_call_detected, json_block_started, json_content_buffer
             
-            if not has_yielded_content and not accumulated_response_for_ltm: # Stream was empty
-                print("  CO: LLM stream was empty.")
-                fallback_message = "I couldn't come up with a response for that."
-                yield fallback_message
-                accumulated_response_for_ltm = fallback_message
+            TOOL_CALL_PREFIX = "TOOL_CALL:"
+            JSON_BLOCK_START = "```json"
+            JSON_BLOCK_END = "```"
 
-        except Exception as e:
-            print(f"  CO: Error consuming LLM stream. Type: {type(e)}, Error: {e}") # More detail
-            import traceback # Import for full traceback
-            traceback.print_exc() # Print the full traceback
-            error_message = "Sorry, there was an error while I was generating my response."
-            yield error_message 
-            accumulated_response_for_ltm = error_message
-             
-        #print(f"  CO: Full assistant response (accumulated): \"{accumulated_response_for_ltm[:100].strip()}...\"")
-        self.mmu.add_stm_turn(role="assistant", content=accumulated_response_for_ltm)
+            try:
+                for chunk in assistant_response_stream:
+                    if not chunk: # Skip empty chunks if any
+                        continue
 
-        # LTM Logging
+                    accumulated_response_for_ltm += chunk # Always accumulate for LTM logging
+
+                    if is_tool_call_detected:
+                        # We are in tool call accumulation mode
+                        json_content_buffer += chunk
+                        if JSON_BLOCK_END in json_content_buffer: # A good signal to try parsing
+                            # --- Call a new helper method to parse json_content_buffer ---
+                            # This helper returns (parsed_tool_call_dict, error_message_if_any)
+                            parsed_data, error_msg = self._parse_tool_call_json(json_content_buffer)
+                            if parsed_data:
+                                tool_name = parsed_data.get("tool_name")
+                                tool_args = parsed_data.get("arguments", {})
+                                print(f"CO_SUCCESS: Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                                yield f"[Debug: Tool call parsed: {tool_name} with args {tool_args}. No user output.]"
+                            else:
+                                yield error_msg # Yield the error message from parsing
+                            return # Exit generator as tool call attempt is processed
+                    else: # Not yet detected as a tool call
+                        leading_buffer += chunk
+                        if TOOL_CALL_PREFIX in leading_buffer:
+                            is_tool_call_detected = True
+                            print(f"CO_DEBUG: '{TOOL_CALL_PREFIX}' detected in stream.")
+                            json_content_buffer = leading_buffer[leading_buffer.find(TOOL_CALL_PREFIX) + len(TOOL_CALL_PREFIX):]
+                            leading_buffer = ""
+                            # Check if the *initial* part already contains the end block
+                            if JSON_BLOCK_END in json_content_buffer:
+                                parsed_data, error_msg = self._parse_tool_call_json(json_content_buffer)
+                                # ... (handle parsed_data/error_msg and return as above) ...
+                                if parsed_data:
+                                    tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
+                                    print(f"CO_SUCCESS (Immediate): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                                    yield f"[Debug: Immediate Tool call parsed: {tool_name}. No user output.]"
+                                else: yield error_msg
+                                return
+                        elif len(leading_buffer) >= MAX_LEAD_BUFFER_SIZE or "\n" in chunk:
+                            # ... (yield leading_buffer, clear it, and then yield current chunk if it wasn't part of buffer flush) ...
+                            # This part for direct answer needs to be careful not to double-yield
+                            print("CO_DEBUG: No TOOL_CALL prefix detected in lead buffer. Assuming direct answer.")
+                            yield leading_buffer 
+                            leading_buffer = "" # Buffer has been yielded
+                            # The current chunk *was* added to leading_buffer. So if we yielded leading_buffer,
+                            # we don't need to yield chunk separately here for this iteration.
+                            # The next iteration will handle the next chunk IF is_tool_call_detected is still false.
+                    
+                    # If loop continues after buffer flush (is_tool_call_detected is False and leading_buffer is empty)
+                    if not is_tool_call_detected and not leading_buffer:
+                        yield chunk
+                
+                # AFTER THE LOOP (stream ended)
+                if is_tool_call_detected and json_content_buffer and JSON_BLOCK_END not in json_content_buffer:
+                    # Stream ended, we were in tool call mode, but no closing ``` was found.
+                    # Try to parse what we have in json_content_buffer anyway.
+                    print("CO_DEBUG_JSON: Stream ended while accumulating tool call. Attempting parse of incomplete buffer.")
+                    parsed_data, error_msg = self._parse_tool_call_json(json_content_buffer)
+                    if parsed_data:
+                        tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
+                        print(f"CO_SUCCESS (End of Stream): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                        yield f"[Debug: End of Stream Tool call parsed: {tool_name}. No user output.]"
+                    else: yield error_msg
+                    # No return here, let the generator finish.
+
+                elif not is_tool_call_detected and leading_buffer: # Flush any remaining leading_buffer
+                    print("CO_DEBUG: Flushing remaining leading_buffer as direct answer at end of stream.")
+                    yield leading_buffer
+
+            except Exception as e_stream_consume:
+                print(f"  CO: Error consuming LLM stream (in response_processor_generator). Type: {type(e_stream_consume)}, Error: {e_stream_consume}")
+                import traceback
+                traceback.print_exc()
+                yield "Sorry, there was an error while I was generating my response."
+
+
+        # Immediately call the generator and return its iterator
+        # The actual LTM logging will be moved after this loop in handle_user_message
+        processed_stream = response_processor_generator()
+        
+        # Consume the processed_stream to build the final response for LTM
+        # and yield chunks to the CIL.
+        # If it was a tool call, the generator might yield a debug message and then stop.
+        final_bot_output_chunks = []
+        for processed_chunk in processed_stream:
+            final_bot_output_chunks.append(processed_chunk)
+            yield processed_chunk # Yield to CIL
+        
+        # Update accumulated_response_for_ltm based on what was actually yielded or processed
+        # If a tool call was detected and handled, final_bot_output_chunks might just be a debug message.
+        # The original accumulated_response_for_ltm has the raw LLM output.
+        # For LTM, we want to log what the LLM *attempted* (the raw accumulated_response_for_ltm),
+        # and then separately log the tool call details or the final user-facing message.
+
+        # --- LTM Logging (Moved to after stream consumption/processing) ---
         print(f"  CO: Preparing to log to LTM for conversation '{self.active_conversation_id}'.")
-        current_ltm_history_len = len(self.mmu.get_ltm_conversation_history(self.active_conversation_id))
-        user_turn_seq_id = current_ltm_history_len + 1
-        #print(f"    LTM logging: User turn seq ID: {user_turn_seq_id} for '{user_message[:30]}...'")
-        user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(self.active_conversation_id, user_turn_seq_id, "user", user_message)
+        # Log the raw user turn
+        # ... (existing user turn logging logic) ...
+        current_ltm_history_len = len(self.mmu.get_ltm_conversation_history(self.active_conversation_id)) # Recalculate
+        user_turn_seq_id = current_ltm_history_len # If user turn not logged yet
+        # Check if user turn was already logged for this interaction.
+        # This needs careful handling of turn sequence.
+        # Let's assume it's simpler: log user turn, then assistant's response/action.
 
-        # Vector Store Learning (uses self.min_tokens_for_vs_learn)
+        # If first turn in LTM log is user, then current_ltm_history_len is okay for user turn seq.
+        # If LTM is empty, user_turn_seq_id will be 0. Sequence should be 1-based.
+        
+        # Simpler LTM logic:
+        # The user message was added to STM already.
+        # Now, log the user message to LTM.
+        # Then, log what the assistant did (direct response or tool call attempt).
+
+        # Ensure user turn is logged once per handle_user_message call
+        # We can use a flag or check if STM has more than one turn where last is not assistant.
+        # For now, this basic sequence should be okay for a single interaction.
+        # The `turn_sequence_id` management needs to be robust across calls.
+        
+        # Let's retrieve the latest turn_sequence_id for this conversation_id from LTM to increment it.
+        # This is a simplified approach for robust turn sequencing.
+        ltm_history_for_seq = self.mmu.get_ltm_conversation_history(
+            self.active_conversation_id, 
+            limit=1, 
+            order_desc=True # <--- ADD THIS
+        )
+        last_seq_id = 0
+        if ltm_history_for_seq:
+            last_seq_id = ltm_history_for_seq[0].get('turn_sequence_id', 0) # Get from the first item
+        print(f"  CO_LTM_DEBUG: Last LTM seq_id found for this convo: {last_seq_id}")
+        user_log_seq_id = last_seq_id + 1
+        print(f"  CO_LTM_DEBUG: User turn to be logged with seq_id: {user_log_seq_id}")
+        user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(
+            self.active_conversation_id, user_log_seq_id, "user", user_message
+        )
+
+        # Now log the assistant's full raw response (which might be a tool call)
+        assistant_action_seq_id = user_log_seq_id + 1
+        print(f"  CO_LTM_DEBUG: Assistant raw output to be logged with seq_id: {assistant_action_seq_id}")
+        self.mmu.log_ltm_interaction(
+            conversation_id=self.active_conversation_id,
+            turn_sequence_id=assistant_action_seq_id,
+            role="assistant_raw_output", # New role to distinguish raw LLM output
+            content=accumulated_response_for_ltm, # This has the full, possibly tool-calling, LLM response
+            llm_model_used=self.default_llm_model,
+            metadata={
+                "retrieved_vector_ids": [res['id'] for res in retrieved_knowledge.get("vector_results",[]) if 'id' in res],
+                "retrieved_fact_ids": [fact['fact_id'] for fact in retrieved_knowledge.get("skb_fact_results",[]) if 'fact_id' in fact],
+                "llm_streamed": True,
+                "is_tool_call_detected_by_co": is_tool_call_detected # Log if CO thought it was a tool call
+            }
+        )
+        print(f"  CO_LTM_DEBUG: Attempted to log user turn with seq_id {user_log_seq_id} (LTM_entry_id: {user_turn_ltm_entry_id}) and assistant_raw_output with seq_id {assistant_action_seq_id}.")
+
+        # Add the *final user-facing message* (if any) or a tool status to STM
+        # `"".join(final_bot_output_chunks)` is what was actually yielded to the user.
+        final_stm_message_for_assistant = "".join(final_bot_output_chunks)
+        if not final_stm_message_for_assistant and is_tool_call_detected:
+            # If tool call was detected and nothing was yielded to user (e.g. only debug message)
+            final_stm_message_for_assistant = f"[CO attempting tool call based on LLM output. Waiting for tool result.]"
+        
+        self.mmu.add_stm_turn(role="assistant", content=final_stm_message_for_assistant)
+
+
+        # Vector Store Learning for user message (existing logic)
         if user_message and not is_likely_question:
+            # ... (existing vector store learning logic, ensure user_turn_ltm_entry_id is correct)
             user_message_tokens = count_tokens(user_message, self.default_llm_model)
             if user_message_tokens >= self.min_tokens_for_vs_learn:
                 print(f"  CO: User message is significant ({user_message_tokens} tokens). Storing to Vector Store.")
-                doc_id_vs = f"user_stmt_{self.active_conversation_id}_{user_turn_seq_id}" 
+                doc_id_vs = f"user_stmt_{self.active_conversation_id}_{user_log_seq_id}"
                 metadata_vs = {
                     "type": "user_statement", "conversation_id": self.active_conversation_id,
-                    "turn_sequence_id": user_turn_seq_id,
+                    "turn_sequence_id": user_log_seq_id, # Use user's log sequence ID
                     "ltm_raw_log_entry_id": user_turn_ltm_entry_id if user_turn_ltm_entry_id else "unknown",
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) 
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 }
-                self.mmu.add_document_to_ltm_vector_store(text_chunk=user_message, metadata=metadata_vs, doc_id=f"user_stmt_{self.active_conversation_id}_{user_turn_seq_id}")
                 vector_store_add_id = self.mmu.add_document_to_ltm_vector_store(
                     text_chunk=user_message, metadata=metadata_vs, doc_id=doc_id_vs
                 )
@@ -609,20 +758,82 @@ class ConversationOrchestrator:
             else:
                 print(f"  CO: User message not stored in Vector Store (tokens: {user_message_tokens} < {self.min_tokens_for_vs_learn}).")
         # --- End Vector Store Learning for user message ---
+
+    def _parse_tool_call_json(self, json_content_after_tool_call_prefix: str) -> tuple[dict | None, str | None]:
+        JSON_BLOCK_START_TAG = "```json"
+        JSON_BLOCK_END_TAG = "```"
+        actual_json_str = None
+
+        print(f"CO_PARSE_DEBUG: Attempting to parse (content after TOOL_CALL: prefix): '''{json_content_after_tool_call_prefix[:300]}...'''")
         
-        # Log Assistant Turn
-        assistant_turn_log_seq_id = user_turn_seq_id + 1
-        print(f"    LTM logging: Assistant turn seq ID: {assistant_turn_log_seq_id} for '{accumulated_response_for_ltm[:30]}...'")
-        self.mmu.log_ltm_interaction(
-            conversation_id=self.active_conversation_id, turn_sequence_id=assistant_turn_log_seq_id,
-            role="assistant", content=accumulated_response_for_ltm,
-            llm_model_used=self.default_llm_model,
-            metadata={
-                "retrieved_vector_ids": [res['id'] for res in retrieved_knowledge.get("vector_results",[]) if 'id' in res],
-                "retrieved_fact_ids": [fact['fact_id'] for fact in retrieved_knowledge.get("skb_fact_results",[]) if 'fact_id' in fact],
-                "llm_streamed": True # Add metadata that it was streamed
-            }
-        )
+        buffer_to_parse_stripped = json_content_after_tool_call_prefix.strip()
+
+        # Priority 1: Check for raw JSON object (starts with { and ends with })
+        if buffer_to_parse_stripped.startswith("{") and buffer_to_parse_stripped.endswith("}"):
+            print(f"CO_PARSE_DEBUG: Buffer starts with '{{' and ends with '}}'. Assuming it's a raw JSON object.")
+            actual_json_str = buffer_to_parse_stripped 
+            # No need for decoder.decode() and idx here if we assume the whole stripped buffer is the JSON
+
+        # Priority 2: Check for markdown block if raw JSON wasn't identified
+        if actual_json_str is None: 
+            md_start_idx = json_content_after_tool_call_prefix.find(JSON_BLOCK_START_TAG) # Use original buffer for find
+            if md_start_idx != -1:
+                md_end_idx = json_content_after_tool_call_prefix.rfind(JSON_BLOCK_END_TAG, md_start_idx + len(JSON_BLOCK_START_TAG))
+                if md_end_idx != -1: # md_end_idx > (md_start_idx + len(JSON_BLOCK_START_TAG) -1) implied by search start
+                    actual_json_str = json_content_after_tool_call_prefix[md_start_idx + len(JSON_BLOCK_START_TAG) : md_end_idx].strip()
+                    print(f"CO_PARSE_DEBUG: Extracted from markdown block: '''{actual_json_str}'''")
+                else:
+                    # Found ```json but no valid closing ```.
+                    # Could the content after ```json be a raw JSON object itself?
+                    possible_json_content = json_content_after_tool_call_prefix[md_start_idx + len(JSON_BLOCK_START_TAG):].strip()
+                    if possible_json_content.startswith("{") and possible_json_content.endswith("}"):
+                        actual_json_str = possible_json_content
+                        print(f"CO_PARSE_DEBUG: Fallback - extracted raw JSON after '```json' (no closing '```' found): '''{actual_json_str}'''")
+                    else:
+                        print(f"CO_PARSE_DEBUG: Found '{JSON_BLOCK_START_TAG}' but no valid closing '{JSON_BLOCK_END_TAG}' and no clear raw JSON after. Buffer: '''{json_content_after_tool_call_prefix[:200]}...'''")
+                        actual_json_str = None
+            # else: No ```json found at all. actual_json_str remains None by this path.
+
+        # If after all attempts, actual_json_str is still None and the buffer_to_parse_stripped looked like it started with {
+        # (but maybe didn't end with }), we can do one last very speculative attempt with decoder.decode
+        # This handles cases like { "foo": "bar" } followed by unexpected text from LLM.
+        if actual_json_str is None and buffer_to_parse_stripped.startswith("{"):
+            print(f"CO_PARSE_DEBUG: Last attempt - buffer started with '{{' but other methods failed. Trying json.JSONDecoder().decode.")
+            decoder = json.JSONDecoder()
+            try:
+                parsed_obj, idx = decoder.decode(buffer_to_parse_stripped)
+                print(f"CO_PARSE_DEBUG: Last attempt decoder.decode succeeded. idx = {idx}, type(idx) = {type(idx)}")
+                if isinstance(idx, int): # Ensure idx is an integer
+                    actual_json_str = buffer_to_parse_stripped[:idx]
+                    print(f"CO_PARSE_DEBUG: Last attempt - Found potential raw JSON object: '''{actual_json_str}'''")
+                else:
+                    print(f"CO_PARSE_DEBUG: Last attempt decoder.decode returned non-integer idx. Cannot use.")
+                    actual_json_str = None # Should not happen if decode doesn't raise error
+            except json.JSONDecodeError:
+                print(f"CO_PARSE_DEBUG: Last attempt decoder.decode failed with JSONDecodeError.")
+                actual_json_str = None
+
+        # Now, try to load 'actual_json_str' if it was populated by either method
+        if actual_json_str:
+            try:
+                parsed_tool_call = json.loads(actual_json_str.strip()) # Strip again for safety
+                if not isinstance(parsed_tool_call, dict):
+                    return None, "[Error: Parsed tool call JSON is not a dictionary.]"
+                tool_name = parsed_tool_call.get("tool_name")
+                arguments = parsed_tool_call.get("arguments")
+                if arguments is not None and not isinstance(arguments, dict):
+                    return None, "[Error: 'arguments' field in tool call JSON is not a dictionary.]"
+
+                if tool_name:
+                    return parsed_tool_call, None
+                else:
+                    return None, "[Error: Parsed tool call JSON missing 'tool_name'.]"
+            except json.JSONDecodeError as json_e:
+                return None, f"[Error: Could not parse tool call JSON. Detail: {json_e}. Content: '''{actual_json_str[:100].strip()}...''']"
+            except Exception as tool_parse_e:
+                return None, f"[Error: Unexpected problem processing tool call JSON. Detail: {tool_parse_e}]"
+        else:
+            return None, "[Error: Malformed tool call structure from LLM - JSON content not found or clear.]"
 
 if __name__ == "__main__":
     print("--- Testing CO (Config-Driven) with Fact Extraction, VS Learning & Summarization ---")
