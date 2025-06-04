@@ -6,6 +6,7 @@ import time
 import gc      
 import json
 from datetime import datetime, timezone
+from .tokenizer_utils import count_tokens 
 
 
 # Conditional imports
@@ -451,6 +452,8 @@ class ConversationOrchestrator:
         """
         if not user_message.strip(): yield "Please say something!"; return
         
+        self.last_raw_llm_response = "" # Initialize for this call
+
         is_new_conversation_session = False
         if not conversation_id:
             conversation_id = str(uuid.uuid4())
@@ -592,9 +595,9 @@ class ConversationOrchestrator:
                                 tool_name = parsed_data.get("tool_name")
                                 tool_args = parsed_data.get("arguments", {})
                                 print(f"CO_SUCCESS: Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
-                                yield f"[Debug: Tool call parsed: {tool_name} with args {tool_args}. No user output.]"
+                                yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
                             else:
-                                yield error_msg # Yield the error message from parsing
+                                yield {"type": "tool_call_error", "message": error_msg}
                             return # Exit generator as tool call attempt is processed
                     else: # Not yet detected as a tool call
                         leading_buffer += chunk
@@ -610,8 +613,8 @@ class ConversationOrchestrator:
                                 if parsed_data:
                                     tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
                                     print(f"CO_SUCCESS (Immediate): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
-                                    yield f"[Debug: Immediate Tool call parsed: {tool_name}. No user output.]"
-                                else: yield error_msg
+                                    yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
+                                else: yield {"type": "tool_call_error", "message": error_msg}
                                 return
                         elif len(leading_buffer) >= MAX_LEAD_BUFFER_SIZE or "\n" in chunk:
                             # ... (yield leading_buffer, clear it, and then yield current chunk if it wasn't part of buffer flush) ...
@@ -636,15 +639,21 @@ class ConversationOrchestrator:
                     if parsed_data:
                         tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
                         print(f"CO_SUCCESS (End of Stream): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
-                        yield f"[Debug: End of Stream Tool call parsed: {tool_name}. No user output.]"
-                    else: yield error_msg
+                        yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
+                    else: yield {"type": "tool_call_error", "message": error_msg}
                     # No return here, let the generator finish.
 
                 elif not is_tool_call_detected and leading_buffer: # Flush any remaining leading_buffer
                     print("CO_DEBUG: Flushing remaining leading_buffer as direct answer at end of stream.")
                     yield leading_buffer
+                # Ensure self.last_raw_llm_response is set before generator finishes or returns in any path.
+                # This should be the last thing in the try block.
+                self.last_raw_llm_response = accumulated_response_for_ltm
 
             except Exception as e_stream_consume:
+                # Also set it here in case of error during stream consumption, 
+                # so we log what we got before the error.
+                self.last_raw_llm_response = accumulated_response_for_ltm
                 print(f"  CO: Error consuming LLM stream (in response_processor_generator). Type: {type(e_stream_consume)}, Error: {e_stream_consume}")
                 import traceback
                 traceback.print_exc()
@@ -658,81 +667,147 @@ class ConversationOrchestrator:
         # Consume the processed_stream to build the final response for LTM
         # and yield chunks to the CIL.
         # If it was a tool call, the generator might yield a debug message and then stop.
-        final_bot_output_chunks = []
-        for processed_chunk in processed_stream:
-            final_bot_output_chunks.append(processed_chunk)
-            yield processed_chunk # Yield to CIL
-        
-        # Update accumulated_response_for_ltm based on what was actually yielded or processed
-        # If a tool call was detected and handled, final_bot_output_chunks might just be a debug message.
-        # The original accumulated_response_for_ltm has the raw LLM output.
-        # For LTM, we want to log what the LLM *attempted* (the raw accumulated_response_for_ltm),
-        # and then separately log the tool call details or the final user-facing message.
+        tool_call_to_execute = None 
+        direct_answer_chunks = []
+        tool_parse_error_message = None # Specific message if JSON parsing failed
 
-        # --- LTM Logging (Moved to after stream consumption/processing) ---
-        print(f"  CO: Preparing to log to LTM for conversation '{self.active_conversation_id}'.")
-        # Log the raw user turn
-        # ... (existing user turn logging logic) ...
-        current_ltm_history_len = len(self.mmu.get_ltm_conversation_history(self.active_conversation_id)) # Recalculate
-        user_turn_seq_id = current_ltm_history_len # If user turn not logged yet
-        # Check if user turn was already logged for this interaction.
-        # This needs careful handling of turn sequence.
-        # Let's assume it's simpler: log user turn, then assistant's response/action.
-
-        # If first turn in LTM log is user, then current_ltm_history_len is okay for user turn seq.
-        # If LTM is empty, user_turn_seq_id will be 0. Sequence should be 1-based.
+        for chunk_or_signal in processed_stream:
+            if isinstance(chunk_or_signal, dict) and chunk_or_signal.get("type") == "tool_call_parsed":
+                tool_call_to_execute = chunk_or_signal # Store the dict: {"tool_name": ..., "arguments": ...}
+                print(f"CO_DEBUG: Received tool_call_parsed signal from generator: {tool_call_to_execute}")
+                # If a tool call is parsed, we don't expect further chunks for direct user output from this LLM stream.
+                break 
+            elif isinstance(chunk_or_signal, dict) and chunk_or_signal.get("type") == "tool_call_error":
+                tool_parse_error_message = chunk_or_signal.get("message")
+                print(f"CO_DEBUG: Received tool_call_error signal from generator: {tool_parse_error_message}")
+                if tool_parse_error_message: # Ensure it's not None
+                     direct_answer_chunks.append(tool_parse_error_message) 
+                     yield tool_parse_error_message # Yield this error to the user for now
+                break # Error in tool call parsing, stop processing this stream.
+            elif isinstance(chunk_or_signal, str):
+                # This is a direct answer chunk from the LLM
+                direct_answer_chunks.append(chunk_or_signal)
+                yield chunk_or_signal # Yield to CIL immediately for streaming direct answers
+            else:
+                # Unexpected chunk type
+                print(f"CO_WARNING: Received unexpected chunk type from response_processor_generator: {type(chunk_or_signal)} - {str(chunk_or_signal)[:100]}")
+                # Optionally yield it if it's a string, or log and ignore
+                if isinstance(chunk_or_signal, str): # Should not happen if type checks above are correct
+                    direct_answer_chunks.append(chunk_or_signal)
+                    yield chunk_or_signal
         
-        # Simpler LTM logic:
-        # The user message was added to STM already.
-        # Now, log the user message to LTM.
-        # Then, log what the assistant did (direct response or tool call attempt).
+        # --- After processing the initial LLM stream from response_processor_generator ---
 
-        # Ensure user turn is logged once per handle_user_message call
-        # We can use a flag or check if STM has more than one turn where last is not assistant.
-        # For now, this basic sequence should be okay for a single interaction.
-        # The `turn_sequence_id` management needs to be robust across calls.
+        final_stm_message_for_assistant = "" # This will be what's put into STM for the assistant's turn
+
+        if tool_call_to_execute:
+            print(f"CO: Tool call detected. Attempting to execute: {tool_call_to_execute.get('tool_name')}")
+            
+            agent_result = None # To store the output of the agent call
+            tool_name = tool_call_to_execute.get("tool_name")
+            tool_args = tool_call_to_execute.get("arguments", {}) # Ensure arguments is a dict, defaults to empty
+
+            # --- Tool Dispatch Logic ---
+            try:
+                if tool_name == "knowledge_search":
+                    print(f"  CO: Dispatching to KnowledgeRetrieverAgent with args: {tool_args}")
+                    if not isinstance(tool_args, dict):
+                        print(f"  CO_ERROR: Arguments for {tool_name} are not a dictionary: {tool_args}")
+                        raise ValueError(f"Arguments for {tool_name} must be a dictionary.")
+                    agent_result = self.knowledge_retriever.search_knowledge(**tool_args)
+                elif tool_name == "text_summarizer":
+                    print(f"  CO: Dispatching to SummarizationAgent with args: {tool_args}")
+                    if not isinstance(tool_args, dict):
+                        print(f"  CO_ERROR: Arguments for {tool_name} are not a dictionary: {tool_args}")
+                        raise ValueError(f"Arguments for {tool_name} must be a dictionary.")
+                    agent_result = self.summarizer.summarize_text(**tool_args)
+                elif tool_name == "fact_extractor":
+                    print(f"  CO: Dispatching to FactExtractionAgent with args: {tool_args}")
+                    if not isinstance(tool_args, dict):
+                        print(f"  CO_ERROR: Arguments for {tool_name} are not a dictionary: {tool_args}")
+                        raise ValueError(f"Arguments for {tool_name} must be a dictionary.")
+                    agent_result = self.fact_extractor.extract_facts(**tool_args)
+                else:
+                    error_msg = f"Unknown tool name '{tool_name}' received for dispatch."
+                    print(f"  CO_ERROR: {error_msg}")
+                    agent_result = {"error": error_msg, "details": f"The LLM requested a tool named '{tool_name}' which is not recognized."}
+                
+                print(f"  CO: Agent '{tool_name}' executed. Raw result (first 200 chars): {str(agent_result)[:200]}...")
+
+            except Exception as e_agent_exec:
+                error_detail = f"Exception during execution of tool '{tool_name}': {str(e_agent_exec)}"
+                print(f"  CO_ERROR: {error_detail}")
+                import traceback
+                traceback.print_exc()
+                agent_result = {"error": error_detail, "exception_type": type(e_agent_exec).__name__}
+            
+            # --- For now, prepare a message for STM and yield it for debugging ---
+            # This will be replaced by observation formatting and re-prompting logic in Task 2 & 3.
+            if agent_result is not None and not (isinstance(agent_result, dict) and "error" in agent_result):
+                # Basic success representation
+                final_stm_message_for_assistant = f"[CO Debug: Tool '{tool_name}' executed. Result (summary): {str(agent_result)[:150]}... Next: Format observation & re-prompt.]"
+                yield final_stm_message_for_assistant # Yield this to CIL for now
+            else: # Agent execution resulted in an error or None
+                error_summary = str(agent_result)[:150] if agent_result else "No result returned from agent."
+                final_stm_message_for_assistant = f"[CO Debug: Tool '{tool_name}' execution error or no result. Detail: {error_summary}... Next: Format error as observation & re-prompt.]"
+                yield final_stm_message_for_assistant # Yield this to CIL for now
         
-        # Let's retrieve the latest turn_sequence_id for this conversation_id from LTM to increment it.
-        # This is a simplified approach for robust turn sequencing.
+        elif tool_parse_error_message:
+            # This means _parse_tool_call_json failed, and its error was already yielded.
+            # direct_answer_chunks contains this error message.
+            final_stm_message_for_assistant = "".join(direct_answer_chunks)
+            # No further yielding to CIL here, as it happened in the loop.
+            print(f"CO: Tool parsing failed. Final STM message will be: {final_stm_message_for_assistant}")
+
+        else: # This was a direct answer from the LLM (no tool_call_to_execute and no tool_parse_error_message)
+            final_stm_message_for_assistant = "".join(direct_answer_chunks)
+            # No further yielding to CIL here, as it happened chunk by chunk in the loop.
+            print(f"CO: Direct answer received. Final STM message will be (first 100 chars): {final_stm_message_for_assistant[:100]}...")
+
+
+        # --- LTM Logging ---
+        raw_llm_output_for_ltm = self.last_raw_llm_response 
+
+        print(f"  CO: Preparing to log to LTM for conversation '{self.active_conversation_id}'. Raw LLM output length for LTM: {len(raw_llm_output_for_ltm)}")
         ltm_history_for_seq = self.mmu.get_ltm_conversation_history(
-            self.active_conversation_id, 
-            limit=1, 
-            order_desc=True # <--- ADD THIS
+            self.active_conversation_id, limit=1, order_desc=True
         )
         last_seq_id = 0
         if ltm_history_for_seq:
-            last_seq_id = ltm_history_for_seq[0].get('turn_sequence_id', 0) # Get from the first item
-        print(f"  CO_LTM_DEBUG: Last LTM seq_id found for this convo: {last_seq_id}")
+            last_seq_id = ltm_history_for_seq[0].get('turn_sequence_id', 0)
+        
         user_log_seq_id = last_seq_id + 1
-        print(f"  CO_LTM_DEBUG: User turn to be logged with seq_id: {user_log_seq_id}")
         user_turn_ltm_entry_id = self.mmu.log_ltm_interaction(
             self.active_conversation_id, user_log_seq_id, "user", user_message
         )
 
-        # Now log the assistant's full raw response (which might be a tool call)
         assistant_action_seq_id = user_log_seq_id + 1
-        print(f"  CO_LTM_DEBUG: Assistant raw output to be logged with seq_id: {assistant_action_seq_id}")
+        metadata_for_ltm_log = {
+            "retrieved_vector_ids": [res.get('id') for res in retrieved_knowledge.get("vector_results",[]) if res.get('id')],
+            "retrieved_fact_ids": [fact.get('fact_id') for fact in retrieved_knowledge.get("skb_fact_results",[]) if fact.get('fact_id')],
+            "llm_streamed": True,
+            "is_tool_call_detected_by_co": bool(tool_call_to_execute) # True if tool_call_to_execute is not None
+        }
+        if tool_call_to_execute: # If a tool call was successfully parsed and an attempt to execute was made
+            metadata_for_ltm_log["tool_called"] = tool_call_to_execute.get("tool_name")
+            metadata_for_ltm_log["tool_arguments"] = tool_call_to_execute.get("arguments")
+            # In later tasks (Task 2), we'll add the actual tool_result (or summary) here too.
+            # For now, just log that it was called and with what args.
+            if agent_result is not None: # Add agent result to metadata if available
+                 metadata_for_ltm_log["tool_agent_raw_result_summary"] = str(agent_result)[:200] # Log a summary
+
+        elif tool_parse_error_message: # If parsing the tool call failed
+            metadata_for_ltm_log["tool_parse_error"] = tool_parse_error_message
+
+
         self.mmu.log_ltm_interaction(
             conversation_id=self.active_conversation_id,
             turn_sequence_id=assistant_action_seq_id,
-            role="assistant_raw_output", # New role to distinguish raw LLM output
-            content=accumulated_response_for_ltm, # This has the full, possibly tool-calling, LLM response
+            role="assistant_raw_output", 
+            content=raw_llm_output_for_ltm, # This is the full raw output from LLM (might be tool call or direct answer)
             llm_model_used=self.default_llm_model,
-            metadata={
-                "retrieved_vector_ids": [res['id'] for res in retrieved_knowledge.get("vector_results",[]) if 'id' in res],
-                "retrieved_fact_ids": [fact['fact_id'] for fact in retrieved_knowledge.get("skb_fact_results",[]) if 'fact_id' in fact],
-                "llm_streamed": True,
-                "is_tool_call_detected_by_co": is_tool_call_detected # Log if CO thought it was a tool call
-            }
+            metadata=metadata_for_ltm_log
         )
-        print(f"  CO_LTM_DEBUG: Attempted to log user turn with seq_id {user_log_seq_id} (LTM_entry_id: {user_turn_ltm_entry_id}) and assistant_raw_output with seq_id {assistant_action_seq_id}.")
-
-        # Add the *final user-facing message* (if any) or a tool status to STM
-        # `"".join(final_bot_output_chunks)` is what was actually yielded to the user.
-        final_stm_message_for_assistant = "".join(final_bot_output_chunks)
-        if not final_stm_message_for_assistant and is_tool_call_detected:
-            # If tool call was detected and nothing was yielded to user (e.g. only debug message)
-            final_stm_message_for_assistant = f"[CO attempting tool call based on LLM output. Waiting for tool result.]"
         
         self.mmu.add_stm_turn(role="assistant", content=final_stm_message_for_assistant)
 
@@ -753,10 +828,10 @@ class ConversationOrchestrator:
                 vector_store_add_id = self.mmu.add_document_to_ltm_vector_store(
                     text_chunk=user_message, metadata=metadata_vs, doc_id=doc_id_vs
                 )
-                if vector_store_add_id: print(f"    CO: User statement stored in Vector Store with ID: {vector_store_add_id}")
-                else: print(f"    CO: Failed to store user statement in Vector Store.")
-            else:
-                print(f"  CO: User message not stored in Vector Store (tokens: {user_message_tokens} < {self.min_tokens_for_vs_learn}).")
+                #if vector_store_add_id: print(f"    CO: User statement stored in Vector Store with ID: {vector_store_add_id}")
+                #else: print(f"    CO: Failed to store user statement in Vector Store.")
+            #else:
+            #    print(f"  CO: User message not stored in Vector Store (tokens: {user_message_tokens} < {self.min_tokens_for_vs_learn}).")
         # --- End Vector Store Learning for user message ---
 
     def _parse_tool_call_json(self, json_content_after_tool_call_prefix: str) -> tuple[dict | None, str | None]:
