@@ -749,16 +749,80 @@ class ConversationOrchestrator:
                 traceback.print_exc()
                 agent_result = {"error": error_detail, "exception_type": type(e_agent_exec).__name__}
             
-            # --- For now, prepare a message for STM and yield it for debugging ---
-            # This will be replaced by observation formatting and re-prompting logic in Task 2 & 3.
-            if agent_result is not None and not (isinstance(agent_result, dict) and "error" in agent_result):
-                # Basic success representation
-                final_stm_message_for_assistant = f"[CO Debug: Tool '{tool_name}' executed. Result (summary): {str(agent_result)[:150]}... Next: Format observation & re-prompt.]"
-                yield final_stm_message_for_assistant # Yield this to CIL for now
-            else: # Agent execution resulted in an error or None
-                error_summary = str(agent_result)[:150] if agent_result else "No result returned from agent."
-                final_stm_message_for_assistant = f"[CO Debug: Tool '{tool_name}' execution error or no result. Detail: {error_summary}... Next: Format error as observation & re-prompt.]"
-                yield final_stm_message_for_assistant # Yield this to CIL for now
+
+            observation_string = "" 
+            
+            if isinstance(agent_result, dict) and "error" in agent_result:
+                # Handle errors from dispatch or agent execution
+                observation_string = f"Error from tool '{tool_name}': {agent_result.get('error', 'Unknown error')}"
+                if "details" in agent_result: # If our unknown tool error
+                    observation_string += f"\nDetails: {agent_result.get('details')}"
+                if "exception_type" in agent_result: # If agent execution exception
+                     observation_string += f"\nException Type: {agent_result.get('exception_type')}"
+
+            elif tool_name == "knowledge_search":
+                if agent_result: # agent_result is {'vector_results': [], 'skb_fact_results': []}
+                    skb_facts = agent_result.get("skb_fact_results", [])
+                    vector_chunks = agent_result.get("vector_results", [])
+                    parts = []
+                    if not skb_facts and not vector_chunks:
+                        parts.append("No specific information found in knowledge base for the query.")
+                    if skb_facts:
+                        parts.append(f"Found {len(skb_facts)} structured fact(s):")
+                        for i, fact in enumerate(skb_facts[:3]): # Show up to 3 facts for brevity
+                            parts.append(f"  Fact {i+1}: Subject='{fact.get('subject')}', Predicate='{fact.get('predicate')}', Object='{fact.get('object')}'")
+                        if len(skb_facts) > 3:
+                            parts.append(f"  (...and {len(skb_facts)-3} more facts)")
+                    if vector_chunks:
+                        parts.append(f"\nFound {len(vector_chunks)} relevant text chunk(s) from past interactions/documents:")
+                        for i, chunk_info in enumerate(vector_chunks[:2]): # Show up to 2 chunks
+                            parts.append(f"  Chunk {i+1} (source: {chunk_info.get('metadata', {}).get('type', 'unknown')}): \"{str(chunk_info.get('text_chunk', ''))[:150]}...\"") # Limit chunk length
+                        if len(vector_chunks) > 2:
+                            parts.append(f"  (...and {len(vector_chunks)-2} more chunks)")
+                    observation_string = "\n".join(parts)
+                else:
+                    observation_string = f"Tool '{tool_name}' executed but returned no result or an unexpected format."
+            
+            elif tool_name == "text_summarizer":
+                if isinstance(agent_result, str) and agent_result.strip():
+                    observation_string = f"Summary generated: \"{agent_result}\""
+                elif agent_result is None or (isinstance(agent_result, str) and not agent_result.strip()):
+                    observation_string = f"Tool '{tool_name}' did not produce a summary."
+                else:
+                    observation_string = f"Tool '{tool_name}' returned an unexpected result format: {str(agent_result)[:100]}"
+
+            elif tool_name == "fact_extractor":
+                if isinstance(agent_result, list):
+                    if agent_result: # If list is not empty
+                        try:
+                            observation_string = f"Extracted facts: {json.dumps(agent_result, indent=2)}"
+                        except TypeError: # Should not happen if agent_result is list of dicts
+                            observation_string = f"Tool '{tool_name}' returned facts that could not be JSON serialized: {str(agent_result)[:150]}"
+                    else: # Empty list
+                        observation_string = f"Tool '{tool_name}' found no new facts to extract from the provided text."
+                elif agent_result is None:
+                     observation_string = f"Tool '{tool_name}' failed or returned no result (None)."
+                else:
+                    observation_string = f"Tool '{tool_name}' returned an unexpected result format: {str(agent_result)[:100]}"
+            
+            else: # Should be caught by unknown tool name in dispatch, but as a fallback
+                observation_string = f"Tool '{tool_name}' executed, but observation formatting for this tool is not explicitly defined. Raw result: {str(agent_result)[:200]}"
+
+            # Ensure observation_string is not empty if agent_result was None from the start
+            if not observation_string and agent_result is None:
+                observation_string = f"Tool '{tool_name}' execution did not yield any result."
+
+            print(f"  CO: Formatted Observation for LLM (first 300 chars): {observation_string[:300]}...")
+            ### END MODIFICATION (Task 2 - Formatting Logic) ###
+            
+            # Replace the old temporary debugging yield/STM message
+            # The actual re-prompt logic will come in Task 3 using this observation_string.
+            # For now, let's update the debug yield and STM message.
+            
+            ### START MODIFICATION (Task 2 - Update Debug Output) ###
+            temp_debug_yield_message = f"[CO Debug: Tool '{tool_name}' processed. Observation prepared. Next: Re-prompt with this observation.]"
+            final_stm_message_for_assistant = temp_debug_yield_message # This will be updated in Task 3
+            yield temp_debug_yield_message # Yield this to CIL for current testing phase
         
         elif tool_parse_error_message:
             # This means _parse_tool_call_json failed, and its error was already yielded.
