@@ -595,8 +595,10 @@ class ConversationOrchestrator:
                                 tool_name = parsed_data.get("tool_name")
                                 tool_args = parsed_data.get("arguments", {})
                                 print(f"CO_SUCCESS: Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                                self.last_raw_llm_response = accumulated_response_for_ltm
                                 yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
                             else:
+                                self.last_raw_llm_response = accumulated_response_for_ltm
                                 yield {"type": "tool_call_error", "message": error_msg}
                             return # Exit generator as tool call attempt is processed
                     else: # Not yet detected as a tool call
@@ -613,8 +615,11 @@ class ConversationOrchestrator:
                                 if parsed_data:
                                     tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
                                     print(f"CO_SUCCESS (Immediate): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                                    self.last_raw_llm_response = accumulated_response_for_ltm
                                     yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
-                                else: yield {"type": "tool_call_error", "message": error_msg}
+                                else: 
+                                    self.last_raw_llm_response = accumulated_response_for_ltm
+                                    yield {"type": "tool_call_error", "message": error_msg}
                                 return
                         elif len(leading_buffer) >= MAX_LEAD_BUFFER_SIZE or "\n" in chunk:
                             # ... (yield leading_buffer, clear it, and then yield current chunk if it wasn't part of buffer flush) ...
@@ -639,8 +644,11 @@ class ConversationOrchestrator:
                     if parsed_data:
                         tool_name = parsed_data.get("tool_name"); tool_args = parsed_data.get("arguments", {})
                         print(f"CO_SUCCESS (End of Stream): Parsed Tool Call - Name: {tool_name}, Args: {tool_args}")
+                        self.last_raw_llm_response = accumulated_response_for_ltm
                         yield {"type": "tool_call_parsed", "tool_name": tool_name, "arguments": tool_args}
-                    else: yield {"type": "tool_call_error", "message": error_msg}
+                    else: 
+                        self.last_raw_llm_response = accumulated_response_for_ltm
+                        yield {"type": "tool_call_error", "message": error_msg}
                     # No return here, let the generator finish.
 
                 elif not is_tool_call_detected and leading_buffer: # Flush any remaining leading_buffer
