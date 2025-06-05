@@ -285,7 +285,7 @@ class ConversationOrchestrator:
             
             elif self.stm_condensation_strategy == "summarize":
                 print(f"    STM Condensation: Attempting 'summarize' strategy.")
-                print(f"      DEBUG: Initial stm_history_turns_original: {json.dumps(stm_history_turns_original, indent=2)}") # DEBUG PRINT
+                #print(f"      DEBUG: Initial stm_history_turns_original: {json.dumps(stm_history_turns_original, indent=2)}") # DEBUG PRINT
                 
                 managed_stm_turns_for_prompt = [] 
                 temp_turns_to_keep_verbatim = []
